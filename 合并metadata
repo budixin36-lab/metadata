@@ -1,0 +1,72 @@
+folder <- "/mnt/d/PRJmetadata"
+
+files <- list.files(folder, pattern = "\\.csv$", full.names = TRUE, recursive = TRUE)
+
+read_one <- function(f) {
+  df <- tryCatch(
+    read.csv(
+      f,
+      stringsAsFactors = FALSE,
+      check.names = FALSE
+    ),
+    error = function(e) {
+      message("读取失败: ", f)
+      return(NULL)
+    }
+  )
+  
+  if (!is.null(df)) {
+    names(df) <- trimws(names(df))
+    names(df)[names(df) == ""] <- paste0("empty_col_", seq_len(sum(names(df) == "")))
+    names(df) <- make.unique(names(df), sep = "_dup_")
+    df$source_file <- basename(f)
+    df$source_path <- f
+  }
+  
+  return(df)
+}
+
+df_list <- lapply(files, read_one)
+df_list <- Filter(Negate(is.null), df_list)
+
+if (length(df_list) == 0) {
+  stop("没有成功读取任何 CSV 文件")
+}
+
+all_cols <- unique(unlist(lapply(df_list, names)))
+
+df_list2 <- lapply(df_list, function(df) {
+  missing_cols <- setdiff(all_cols, names(df))
+  
+  if (length(missing_cols) > 0) {
+    for (col in missing_cols) {
+      df[[col]] <- NA
+    }
+  }
+  
+  df <- df[, intersect(all_cols, names(df)), drop = FALSE]
+  
+  still_missing <- setdiff(all_cols, names(df))
+  if (length(still_missing) > 0) {
+    for (col in still_missing) {
+      df[[col]] <- NA
+    }
+  }
+  
+  df <- df[, all_cols, drop = FALSE]
+  return(df)
+})
+
+merged <- do.call(rbind, df_list2)
+
+write.csv(
+  merged,
+  file.path(folder, "metadata_merged_all_columns.csv"),
+  row.names = FALSE,
+  na = ""
+)
+
+cat("合并完成\n")
+cat("成功读取文件数:", length(df_list), "\n")
+cat("总行数:", nrow(merged), "\n")
+cat("总列数:", ncol(merged), "\n")
