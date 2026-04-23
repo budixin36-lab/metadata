@@ -70,3 +70,27 @@ cat("合并完成\n")
 cat("成功读取文件数:", length(df_list), "\n")
 cat("总行数:", nrow(merged), "\n")
 cat("总列数:", ncol(merged), "\n")
+library(readxl)
+
+meta <- read.csv("/mnt/d/PRJmetadata/metadata_merged_all_columns.csv",
+                 stringsAsFactors = FALSE,
+                 check.names = FALSE)
+
+primer <- read_excel("/mnt/d/primerseq.xlsx")
+
+names(meta) <- trimws(names(meta))
+names(primer) <- trimws(names(primer))
+
+meta$BioProject <- trimws(meta$BioProject)
+primer$BioProject <- trimws(primer$BioProject)
+
+primer2 <- unique(as.data.frame(primer[, c("BioProject", "amplified_region")]))
+
+meta$amplified_region <- primer2$amplified_region[
+  match(meta$BioProject, primer2$BioProject)
+]
+
+write.csv(meta,
+          "/mnt/d/PRJmetadata/metadata_merged_with_amplified_region.csv",
+          row.names = FALSE,
+          na = "")
