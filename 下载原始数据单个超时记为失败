@@ -1,0 +1,185 @@
+#先运行：
+mkdir -p /mnt/d/ITS
+nano /mnt/d/ITS/download_ena_by_project_timeout.sh
+#然后会打开一个编辑界面。把我之前那整段脚本完整粘进去。
+#内容如下：
+#!/usr/bin/env bash
+set -u
+set -o pipefail
+
+LIST_DIR="/mnt/d/SRR_Acc_List"
+OUT_ROOT="/mnt/d/ITS/rawfastq"
+LOG_DIR="${OUT_ROOT}/logs"
+
+ASCP_BIN="/home/budixin/.aspera/connect/bin/ascp"
+ASPERA_KEY="/home/budixin/.aspera/connect/etc/asperaweb_id_dsa.openssh"
+
+# 单个文件下载超时秒数：10分钟
+ASCP_TIMEOUT=600
+
+mkdir -p "$OUT_ROOT" "$LOG_DIR"
+
+DOWNLOAD_LOG="${LOG_DIR}/download.log"
+FAIL_LOG="${LOG_DIR}/failed.log"
+MD5_LOG="${LOG_DIR}/md5_failed.log"
+SUCCESS_LOG="${LOG_DIR}/success.log"
+TIMEOUT_LOG="${LOG_DIR}/timeout.log"
+
+touch "$DOWNLOAD_LOG" "$FAIL_LOG" "$MD5_LOG" "$SUCCESS_LOG" "$TIMEOUT_LOG"
+
+timestamp() {
+  date "+%F %T"
+}
+
+check_dep() {
+  command -v curl >/dev/null 2>&1 || { echo "缺少 curl"; exit 1; }
+  command -v md5sum >/dev/null 2>&1 || { echo "缺少 md5sum"; exit 1; }
+  command -v timeout >/dev/null 2>&1 || { echo "缺少 timeout"; exit 1; }
+  [ -f "$ASCP_BIN" ] || { echo "找不到 ascp: $ASCP_BIN"; exit 1; }
+  [ -f "$ASPERA_KEY" ] || { echo "找不到 Aspera key: $ASPERA_KEY"; exit 1; }
+  [ -d "$LIST_DIR" ] || { echo "找不到 SRR 列表目录: $LIST_DIR"; exit 1; }
+}
+
+fetch_ena_info() {
+  local run="$1"
+  curl -fsSL "https://www.ebi.ac.uk/ena/portal/api/filereport?accession=${run}&result=read_run&fields=run_accession,fastq_aspera,fastq_md5&format=tsv" 2>/dev/null
+}
+
+download_one_file() {
+  local aspera_path="$1"
+  local expected_md5="$2"
+  local out_dir="$3"
+  local project="$4"
+  local run="$5"
+
+  local remote="era-fasp@${aspera_path}"
+  local filename
+  filename="$(basename "$aspera_path")"
+  local outfile="${out_dir}/${filename}"
+
+  if [ -f "$outfile" ]; then
+    local local_md5
+    local_md5="$(md5sum "$outfile" | awk '{print $1}')"
+    if [ "$local_md5" = "$expected_md5" ]; then
+      echo "$(timestamp) [SKIP_OK] ${project} ${run} ${filename}" | tee -a "$SUCCESS_LOG"
+      return 0
+    else
+      echo "$(timestamp) [DELETE_BAD_EXISTING] ${outfile}" | tee -a "$MD5_LOG"
+      rm -f "$outfile"
+    fi
+  fi
+
+  echo "$(timestamp) [DOWNLOADING] ${project} ${run} ${filename}" | tee -a "$DOWNLOAD_LOG"
+
+  timeout "${ASCP_TIMEOUT}" \
+    "$ASCP_BIN" \
+    -QT \
+    -P 33001 \
+    -k 1 \
+    -l 50m \
+    -m 10m \
+    -i "$ASPERA_KEY" \
+    "$remote" \
+    "$out_dir/"
+
+  local rc=$?
+
+  if [ $rc -eq 124 ]; then
+    echo "$(timestamp) [TIMEOUT] ${project} ${run} ${filename}" | tee -a "$TIMEOUT_LOG" "$FAIL_LOG"
+    rm -f "$outfile"
+    return 1
+  fi
+
+  if [ $rc -ne 0 ]; then
+    echo "$(timestamp) [DOWNLOAD_FAIL] ${project} ${run} ${filename}" | tee -a "$FAIL_LOG"
+    rm -f "$outfile"
+    return 1
+  fi
+
+  if [ ! -f "$outfile" ]; then
+    echo "$(timestamp) [MISSING_AFTER_DOWNLOAD] ${project} ${run} ${filename}" | tee -a "$FAIL_LOG"
+    return 1
+  fi
+
+  local got_md5
+  got_md5="$(md5sum "$outfile" | awk '{print $1}')"
+
+  if [ "$got_md5" = "$expected_md5" ]; then
+    echo "$(timestamp) [OK] ${project} ${run} ${filename}" | tee -a "$SUCCESS_LOG"
+    return 0
+  else
+    echo "$(timestamp) [MD5_FAIL] ${project} ${run} ${filename} expected=${expected_md5} got=${got_md5}" | tee -a "$MD5_LOG"
+    rm -f "$outfile"
+    return 1
+  fi
+}
+
+process_one_run() {
+  local run="$1"
+  local project="$2"
+  local out_dir="$3"
+
+  local tsv
+  tsv="$(fetch_ena_info "$run")"
+
+  if [ -z "$tsv" ]; then
+    echo "$(timestamp) [ENA_QUERY_FAIL] ${project} ${run}" | tee -a "$FAIL_LOG"
+    return 1
+  fi
+
+  local line
+  line="$(echo "$tsv" | tail -n +2 | head -n 1)"
+
+  if [ -z "$line" ]; then
+    echo "$(timestamp) [ENA_EMPTY] ${project} ${run}" | tee -a "$FAIL_LOG"
+    return 1
+  fi
+
+  local run_accession fastq_aspera fastq_md5
+  IFS=$'\t' read -r run_accession fastq_aspera fastq_md5 <<< "$line"
+
+  if [ -z "${fastq_aspera:-}" ] || [ -z "${fastq_md5:-}" ]; then
+    echo "$(timestamp) [NO_FASTQ_INFO] ${project} ${run}" | tee -a "$FAIL_LOG"
+    return 1
+  fi
+
+  IFS=';' read -r -a paths <<< "$fastq_aspera"
+  IFS=';' read -r -a md5s <<< "$fastq_md5"
+
+  if [ "${#paths[@]}" -ne "${#md5s[@]}" ]; then
+    echo "$(timestamp) [PATH_MD5_COUNT_MISMATCH] ${project} ${run}" | tee -a "$FAIL_LOG"
+    return 1
+  fi
+
+  local i
+  for ((i=0; i<${#paths[@]}; i++)); do
+    download_one_file "${paths[$i]}" "${md5s[$i]}" "$out_dir" "$project" "$run" || true
+  done
+}
+
+main() {
+  check_dep
+
+  shopt -s nullglob
+  local listfile
+  for listfile in "${LIST_DIR}"/*_SRR_Acc_List.txt; do
+    local base project out_dir
+    base="$(basename "$listfile")"
+    project="${base%_SRR_Acc_List.txt}"
+    out_dir="${OUT_ROOT}/${project}"
+
+    mkdir -p "$out_dir"
+
+    echo "$(timestamp) [PROJECT_START] ${project}" | tee -a "$DOWNLOAD_LOG"
+
+    while IFS= read -r run || [ -n "$run" ]; do
+      run="$(echo "$run" | tr -d '\r' | xargs)"
+      [ -z "$run" ] && continue
+      process_one_run "$run" "$project" "$out_dir"
+    done < "$listfile"
+
+    echo "$(timestamp) [PROJECT_DONE] ${project}" | tee -a "$DOWNLOAD_LOG"
+  done
+}
+
+main
