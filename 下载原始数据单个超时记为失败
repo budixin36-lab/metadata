@@ -183,3 +183,10 @@ main() {
 }
 
 main
+#粘完后按：
+Ctrl + O #保存
+#回车确认文件名
+Ctrl + X #退出
+#保存后运行：
+chmod +x /mnt/d/ITS/download_ena_by_project_timeout.sh
+bash /mnt/d/ITS/download_ena_by_project_timeout.sh
