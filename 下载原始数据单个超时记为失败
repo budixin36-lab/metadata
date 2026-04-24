@@ -190,3 +190,8 @@ Ctrl + X #退出
 #保存后运行：
 chmod +x /mnt/d/ITS/download_ena_by_project_timeout.sh
 bash /mnt/d/ITS/download_ena_by_project_timeout.sh
+#关机前：
+Ctrl + C
+pkill -9 ascp
+#开机后：
+bash /mnt/d/ITS/download_ena_by_project_timeout.sh
