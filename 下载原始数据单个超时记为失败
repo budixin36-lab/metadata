@@ -193,5 +193,7 @@ bash /mnt/d/ITS/download_ena_by_project_timeout.sh
 #关机前：
 Ctrl + C
 pkill -9 ascp
+pkill -f download_ena_by_project_timeout.sh
+ps -ef | grep ascp
 #开机后：
 bash /mnt/d/ITS/download_ena_by_project_timeout.sh
