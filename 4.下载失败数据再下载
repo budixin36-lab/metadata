@@ -1,1 +1,186 @@
+#先运行：
+mkdir -p /mnt/d/ITS
+nano /mnt/d/ITS/make_retry_list.sh
+#然后会打开一个编辑界面。把我之前那整段脚本完整粘进去。
+#内容如下：
+#!/usr/bin/env bash
+set -euo pipefail
 
+LOG_DIR="/mnt/d/ITS/rawfastq/logs"
+OUT_DIR="/mnt/d/ITS/retry_lists"
+
+mkdir -p "$OUT_DIR"
+
+FAILED_LOG="${LOG_DIR}/failed.log"
+MD5_LOG="${LOG_DIR}/md5_failed.log"
+TIMEOUT_LOG="${LOG_DIR}/timeout.log"
+
+# 第5列才是 run accession
+awk '{print $5}' "$FAILED_LOG" "$MD5_LOG" "$TIMEOUT_LOG" \
+  | sed '/^$/d' \
+  | sort -u > "${OUT_DIR}/retry_runs_all.txt"
+
+awk '/MD5_FAIL/ {print $5}' "$MD5_LOG" \
+  | sed '/^$/d' \
+  | sort -u > "${OUT_DIR}/retry_runs_md5fail.txt"
+
+awk '/DOWNLOAD_FAIL|MISSING_AFTER_DOWNLOAD/ {print $5}' "$FAILED_LOG" \
+  | sed '/^$/d' \
+  | sort -u > "${OUT_DIR}/retry_runs_aspera.txt"
+
+awk '{print $5}' "$TIMEOUT_LOG" \
+  | sed '/^$/d' \
+  | sort -u >> "${OUT_DIR}/retry_runs_aspera.txt"
+
+sort -u "${OUT_DIR}/retry_runs_aspera.txt" -o "${OUT_DIR}/retry_runs_aspera.txt"
+
+awk '/ENA_QUERY_FAIL/ {print $5}' "$FAILED_LOG" \
+  | sed '/^$/d' \
+  | sort -u > "${OUT_DIR}/retry_runs_enaquery.txt"
+
+echo "已生成："
+ls -lh "$OUT_DIR"
+
+#运行：
+chmod +x /mnt/d/ITS/make_retry_list.sh
+bash /mnt/d/ITS/make_retry_list.sh
+#生成后你会得到：
+#retry_runs_all.txt
+#retry_runs_md5fail.txt
+#retry_runs_aspera.txt
+#retry_runs_enaquery.txt
+
+#先补普通失败和超时项
+#这一步还是用 Aspera，但只跑 retry_runs_aspera.txt，不会重下已经成功的文件。
+mkdir -p /mnt/d/ITS
+nano /mnt/d/ITS/retry_failed_with_aspera.sh
+#内容如下：
+#!/usr/bin/env bash
+set -u
+set -o pipefail
+
+RUN_LIST="/mnt/d/ITS/retry_lists/retry_runs_aspera.txt"
+OUT_ROOT="/mnt/d/ITS/rawfastq"
+LOG_DIR="${OUT_ROOT}/logs_retry_aspera"
+
+ASCP_BIN="/home/budixin/.aspera/connect/bin/ascp"
+ASPERA_KEY="/home/budixin/.aspera/connect/etc/asperaweb_id_dsa.openssh"
+ASCP_TIMEOUT=600
+
+mkdir -p "$OUT_ROOT" "$LOG_DIR"
+
+DOWNLOAD_LOG="${LOG_DIR}/download.log"
+FAIL_LOG="${LOG_DIR}/failed.log"
+MD5_LOG="${LOG_DIR}/md5_failed.log"
+SUCCESS_LOG="${LOG_DIR}/success.log"
+TIMEOUT_LOG="${LOG_DIR}/timeout.log"
+
+touch "$DOWNLOAD_LOG" "$FAIL_LOG" "$MD5_LOG" "$SUCCESS_LOG" "$TIMEOUT_LOG"
+
+timestamp() {
+  date "+%F %T"
+}
+
+fetch_ena_info() {
+  local run="$1"
+  curl -fsSL "https://www.ebi.ac.uk/ena/portal/api/filereport?accession=${run}&result=read_run&fields=run_accession,study_accession,fastq_aspera,fastq_md5&format=tsv" 2>/dev/null
+}
+
+download_one_file() {
+  local aspera_path="$1"
+  local expected_md5="$2"
+  local out_dir="$3"
+  local project="$4"
+  local run="$5"
+
+  local remote="era-fasp@${aspera_path}"
+  local filename
+  filename="$(basename "$aspera_path")"
+  local outfile="${out_dir}/${filename}"
+
+  if [ -f "$outfile" ]; then
+    local local_md5
+    local_md5="$(md5sum "$outfile" | awk '{print $1}')"
+    if [ "$local_md5" = "$expected_md5" ]; then
+      echo "$(timestamp) [SKIP_OK] ${project} ${run} ${filename}" | tee -a "$SUCCESS_LOG"
+      return 0
+    else
+      rm -f "$outfile"
+    fi
+  fi
+
+  echo "$(timestamp) [DOWNLOADING] ${project} ${run} ${filename}" | tee -a "$DOWNLOAD_LOG"
+
+  timeout "${ASCP_TIMEOUT}" \
+    "$ASCP_BIN" \
+    -QT \
+    -P 33001 \
+    -k 1 \
+    -l 50m \
+    -m 10m \
+    -i "$ASPERA_KEY" \
+    "$remote" \
+    "$out_dir/"
+
+  local rc=$?
+
+  if [ $rc -eq 124 ]; then
+    echo "$(timestamp) [TIMEOUT] ${project} ${run} ${filename}" | tee -a "$TIMEOUT_LOG" "$FAIL_LOG"
+    rm -f "$outfile"
+    return 1
+  fi
+
+  if [ $rc -ne 0 ]; then
+    echo "$(timestamp) [DOWNLOAD_FAIL] ${project} ${run} ${filename}" | tee -a "$FAIL_LOG"
+    rm -f "$outfile"
+    return 1
+  fi
+
+  if [ ! -f "$outfile" ]; then
+    echo "$(timestamp) [MISSING_AFTER_DOWNLOAD] ${project} ${run} ${filename}" | tee -a "$FAIL_LOG"
+    return 1
+  fi
+
+  local got_md5
+  got_md5="$(md5sum "$outfile" | awk '{print $1}')"
+
+  if [ "$got_md5" = "$expected_md5" ]; then
+    echo "$(timestamp) [OK] ${project} ${run} ${filename}" | tee -a "$SUCCESS_LOG"
+  else
+    echo "$(timestamp) [MD5_FAIL] ${project} ${run} ${filename} expected=${expected_md5} got=${got_md5}" | tee -a "$MD5_LOG"
+    rm -f "$outfile"
+  fi
+}
+
+while IFS= read -r run || [ -n "$run" ]; do
+  run="$(echo "$run" | xargs)"
+  [ -z "$run" ] && continue
+
+  tsv="$(fetch_ena_info "$run")"
+  line="$(echo "$tsv" | tail -n +2 | head -n 1)"
+
+  if [ -z "$line" ]; then
+    echo "$(timestamp) [ENA_QUERY_FAIL] UNKNOWN ${run}" | tee -a "$FAIL_LOG"
+    continue
+  fi
+
+  IFS=$'\t' read -r run_accession study_accession fastq_aspera fastq_md5 <<< "$line"
+
+  if [ -z "${fastq_aspera:-}" ] || [ -z "${fastq_md5:-}" ] || [ -z "${study_accession:-}" ]; then
+    echo "$(timestamp) [NO_FASTQ_INFO] ${study_accession:-UNKNOWN} ${run}" | tee -a "$FAIL_LOG"
+    continue
+  fi
+
+  out_dir="${OUT_ROOT}/${study_accession}"
+  mkdir -p "$out_dir"
+
+  IFS=';' read -r -a paths <<< "$fastq_aspera"
+  IFS=';' read -r -a md5s <<< "$fastq_md5"
+
+  for ((i=0; i<${#paths[@]}; i++)); do
+    download_one_file "${paths[$i]}" "${md5s[$i]}" "$out_dir" "$study_accession" "$run" || true
+  done
+done < "$RUN_LIST"
+#运行：
+chmod +x /mnt/d/ITS/retry_failed_with_aspera.sh
+bash /mnt/d/ITS/retry_failed_with_aspera.sh
