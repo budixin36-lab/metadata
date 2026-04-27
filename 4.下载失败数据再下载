@@ -446,3 +446,294 @@ mkdir -p /mnt/d/ITS/rawfastq/PRJCA004877
   -d \
   aspera01@download.cncb.ac.cn:gsa/CRA004093 \
   /mnt/d/ITS/rawfastq/PRJCA004877
+#把下面这个脚本保存成/mnt/d/ITS/flatten_prjca004877.sh：
+mkdir -p /mnt/d/ITS
+nano /mnt/d/ITS/flatten_prjca004877.sh
+#脚本内容如下：
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_DIR="/mnt/d/ITS/rawfastq/PRJCA004877"
+SOURCE_DIR="${PROJECT_DIR}/CRA004093"
+
+echo "开始整理: ${PROJECT_DIR}"
+
+if [ ! -d "$PROJECT_DIR" ]; then
+  echo "错误：找不到项目目录 $PROJECT_DIR"
+  exit 1
+fi
+
+if [ ! -d "$SOURCE_DIR" ]; then
+  echo "错误：找不到源目录 $SOURCE_DIR"
+  exit 1
+fi
+
+# 1. 把所有 fq.gz / fastq.gz 文件挪到项目根目录
+find "$SOURCE_DIR" -type f \( -name "*.fq.gz" -o -name "*.fastq.gz" \) -print0 | while IFS= read -r -d '' f; do
+  base="$(basename "$f")"
+  dest="${PROJECT_DIR}/${base}"
+
+  if [ -e "$dest" ]; then
+    echo "跳过已存在文件: $dest"
+  else
+    mv "$f" "$dest"
+    echo "已移动: $base"
+  fi
+done
+
+# 2. 把 _f1.fq.gz 改成 _1.fastq.gz
+find "$PROJECT_DIR" -maxdepth 1 -type f -name "*_f1.fq.gz" -print0 | while IFS= read -r -d '' f; do
+  dir="$(dirname "$f")"
+  base="$(basename "$f")"
+  new="${base%_f1.fq.gz}_1.fastq.gz"
+  mv "$f" "$dir/$new"
+  echo "已重命名: $base -> $new"
+done
+
+# 3. 把 _r2.fq.gz 改成 _2.fastq.gz
+find "$PROJECT_DIR" -maxdepth 1 -type f -name "*_r2.fq.gz" -print0 | while IFS= read -r -d '' f; do
+  dir="$(dirname "$f")"
+  base="$(basename "$f")"
+  new="${base%_r2.fq.gz}_2.fastq.gz"
+  mv "$f" "$dir/$new"
+  echo "已重命名: $base -> $new"
+done
+
+# 4. 可选：如果有单端 .fq.gz，也统一改成 .fastq.gz
+find "$PROJECT_DIR" -maxdepth 1 -type f -name "*.fq.gz" ! -name "*_f1.fq.gz" ! -name "*_r2.fq.gz" -print0 | while IFS= read -r -d '' f; do
+  dir="$(dirname "$f")"
+  base="$(basename "$f")"
+  new="${base%.fq.gz}.fastq.gz"
+  if [ "$base" != "$new" ]; then
+    mv "$f" "$dir/$new"
+    echo "已重命名: $base -> $new"
+  fi
+done
+
+# 5. 如果你不需要 xml，可取消下面注释删除
+# find "$PROJECT_DIR" -maxdepth 1 -type f -name "*.xml" -delete
+
+# 6. 删除整理后留下的空目录
+find "$PROJECT_DIR" -type d -empty -delete
+
+echo "整理完成。当前项目根目录内容："
+ls -lh "$PROJECT_DIR"
+
+#运行：
+bash /mnt/d/ITS/flatten_prjca004877.sh
+
+#把下面这个脚本保存成/mnt/d/ITS/check_one_project_missing.sh：
+mkdir -p /mnt/d/ITS
+nano /mnt/d/ITS/check_one_project_missing.sh
+#脚本内容如下：
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT="PRJDB36099"
+LIST_FILE="/mnt/d/SRR_Acc_List/${PROJECT}_SRR_Acc_List.txt"
+PROJECT_DIR="/mnt/d/ITS/rawfastq/${PROJECT}"
+OUT_DIR="/mnt/d/ITS/project_check/${PROJECT}"
+
+mkdir -p "$OUT_DIR"
+
+MISSING_FILE="${OUT_DIR}/missing_runs.txt"
+PRESENT_FILE="${OUT_DIR}/present_runs.txt"
+SUMMARY_FILE="${OUT_DIR}/summary.txt"
+
+: > "$MISSING_FILE"
+: > "$PRESENT_FILE"
+: > "$SUMMARY_FILE"
+
+if [ ! -f "$LIST_FILE" ]; then
+  echo "找不到 accession list: $LIST_FILE"
+  exit 1
+fi
+
+if [ ! -d "$PROJECT_DIR" ]; then
+  echo "找不到项目目录: $PROJECT_DIR"
+  exit 1
+fi
+
+total_runs=0
+runs_present=0
+runs_missing=0
+
+while IFS= read -r run || [ -n "$run" ]; do
+  run="$(echo "$run" | tr -d '\r' | xargs)"
+  [ -z "$run" ] && continue
+
+  total_runs=$((total_runs + 1))
+
+  found=0
+
+  # 匹配单端和双端两种命名
+  for f in \
+    "${PROJECT_DIR}/${run}.fastq.gz" \
+    "${PROJECT_DIR}/${run}.fq.gz" \
+    "${PROJECT_DIR}/${run}_1.fastq.gz" \
+    "${PROJECT_DIR}/${run}_2.fastq.gz" \
+    "${PROJECT_DIR}/${run}_1.fq.gz" \
+    "${PROJECT_DIR}/${run}_2.fq.gz"
+  do
+    if [ -f "$f" ]; then
+      found=1
+      break
+    fi
+  done
+
+  if [ "$found" -eq 1 ]; then
+    runs_present=$((runs_present + 1))
+    echo "$run" >> "$PRESENT_FILE"
+  else
+    runs_missing=$((runs_missing + 1))
+    echo "$run" >> "$MISSING_FILE"
+  fi
+done < "$LIST_FILE"
+
+{
+  echo "PROJECT=${PROJECT}"
+  echo "TOTAL_RUNS=${total_runs}"
+  echo "RUNS_PRESENT=${runs_present}"
+  echo "RUNS_MISSING=${runs_missing}"
+} > "$SUMMARY_FILE"
+
+echo "检查完成"
+cat "$SUMMARY_FILE"
+echo
+echo "缺失清单：$MISSING_FILE"
+#运行：
+bash /mnt/d/ITS/check_one_project_missing.sh
+
+#把下面这个脚本保存成/mnt/d/ITS/retry_one_project_missing_with_aspera.sh：
+mkdir -p /mnt/d/ITS
+nano /mnt/d/ITS/retry_one_project_missing_with_aspera.sh
+#脚本内容如下：
+#!/usr/bin/env bash
+set -u
+set -o pipefail
+
+PROJECT="PRJDB36099"
+RUN_LIST="/mnt/d/ITS/project_check/${PROJECT}/missing_runs.txt"
+OUT_ROOT="/mnt/d/ITS/rawfastq"
+LOG_DIR="${OUT_ROOT}/logs_retry_${PROJECT}"
+
+ASCP_BIN="/home/budixin/.aspera/connect/bin/ascp"
+ASPERA_KEY="/home/budixin/.aspera/connect/etc/asperaweb_id_dsa.openssh"
+ASCP_TIMEOUT=600
+
+mkdir -p "$OUT_ROOT" "$LOG_DIR"
+
+DOWNLOAD_LOG="${LOG_DIR}/download.log"
+FAIL_LOG="${LOG_DIR}/failed.log"
+MD5_LOG="${LOG_DIR}/md5_failed.log"
+SUCCESS_LOG="${LOG_DIR}/success.log"
+TIMEOUT_LOG="${LOG_DIR}/timeout.log"
+
+touch "$DOWNLOAD_LOG" "$FAIL_LOG" "$MD5_LOG" "$SUCCESS_LOG" "$TIMEOUT_LOG"
+
+timestamp() {
+  date "+%F %T"
+}
+
+fetch_ena_info() {
+  local run="$1"
+  curl -fsSL "https://www.ebi.ac.uk/ena/portal/api/filereport?accession=${run}&result=read_run&fields=run_accession,study_accession,fastq_aspera,fastq_md5&format=tsv" 2>/dev/null
+}
+
+download_one_file() {
+  local aspera_path="$1"
+  local expected_md5="$2"
+  local out_dir="$3"
+  local project="$4"
+  local run="$5"
+
+  local remote="era-fasp@${aspera_path}"
+  local filename
+  filename="$(basename "$aspera_path")"
+  local outfile="${out_dir}/${filename}"
+
+  if [ -f "$outfile" ]; then
+    local local_md5
+    local_md5="$(md5sum "$outfile" | awk '{print $1}')"
+    if [ "$local_md5" = "$expected_md5" ]; then
+      echo "$(timestamp) [SKIP_OK] ${project} ${run} ${filename}" | tee -a "$SUCCESS_LOG"
+      return 0
+    else
+      rm -rf "$outfile"
+    fi
+  fi
+
+  echo "$(timestamp) [DOWNLOADING] ${project} ${run} ${filename}" | tee -a "$DOWNLOAD_LOG"
+
+  timeout "${ASCP_TIMEOUT}" \
+    "$ASCP_BIN" \
+    -QT \
+    -P 33001 \
+    -k 1 \
+    -l 50m \
+    -m 10m \
+    -i "$ASPERA_KEY" \
+    "$remote" \
+    "$out_dir/"
+
+  local rc=$?
+
+  if [ $rc -eq 124 ]; then
+    echo "$(timestamp) [TIMEOUT] ${project} ${run} ${filename}" | tee -a "$TIMEOUT_LOG" "$FAIL_LOG"
+    rm -rf "$outfile"
+    return 1
+  fi
+
+  if [ $rc -ne 0 ]; then
+    echo "$(timestamp) [DOWNLOAD_FAIL] ${project} ${run} ${filename}" | tee -a "$FAIL_LOG"
+    rm -rf "$outfile"
+    return 1
+  fi
+
+  if [ ! -f "$outfile" ]; then
+    echo "$(timestamp) [MISSING_AFTER_DOWNLOAD] ${project} ${run} ${filename}" | tee -a "$FAIL_LOG"
+    return 1
+  fi
+
+  local got_md5
+  got_md5="$(md5sum "$outfile" | awk '{print $1}')"
+
+  if [ "$got_md5" = "$expected_md5" ]; then
+    echo "$(timestamp) [OK] ${project} ${run} ${filename}" | tee -a "$SUCCESS_LOG"
+  else
+    echo "$(timestamp) [MD5_FAIL] ${project} ${run} ${filename} expected=${expected_md5} got=${got_md5}" | tee -a "$MD5_LOG"
+    rm -rf "$outfile"
+  fi
+}
+
+while IFS= read -r run || [ -n "$run" ]; do
+  run="$(echo "$run" | xargs)"
+  [ -z "$run" ] && continue
+
+  tsv="$(fetch_ena_info "$run")"
+  line="$(echo "$tsv" | tail -n +2 | head -n 1)"
+
+  if [ -z "$line" ]; then
+    echo "$(timestamp) [ENA_QUERY_FAIL] ${PROJECT} ${run}" | tee -a "$FAIL_LOG"
+    continue
+  fi
+
+  IFS=$'\t' read -r run_accession study_accession fastq_aspera fastq_md5 <<< "$line"
+
+  if [ -z "${fastq_aspera:-}" ] || [ -z "${fastq_md5:-}" ]; then
+    echo "$(timestamp) [NO_FASTQ_INFO] ${PROJECT} ${run}" | tee -a "$FAIL_LOG"
+    continue
+  fi
+
+  out_dir="${OUT_ROOT}/${PROJECT}"
+  mkdir -p "$out_dir"
+
+  IFS=';' read -r -a paths <<< "$fastq_aspera"
+  IFS=';' read -r -a md5s <<< "$fastq_md5"
+
+  for ((i=0; i<${#paths[@]}; i++)); do
+    download_one_file "${paths[$i]}" "${md5s[$i]}" "$out_dir" "$PROJECT" "$run" || true
+  done
+done < "$RUN_LIST"
+#运行：
+bash /mnt/d/ITS/retry_one_project_missing_with_aspera.sh
