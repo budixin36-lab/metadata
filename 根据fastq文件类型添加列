@@ -1,0 +1,68 @@
+新建脚本：
+nano add_single_paired.R
+#粘贴下面内容：
+metadata_file <- "/mnt/d/PRJmetadata/metadata_valid.csv"
+rawfastq_dir  <- "/mnt/d/ITS/rawfastq"
+
+metadata <- read.csv(metadata_file, stringsAsFactors = FALSE, check.names = FALSE)
+
+clean_run <- function(x) {
+  x <- as.character(x)
+  x <- sub("^trim\\.", "", x)      # 去掉 trim. 前缀
+  x <- sub("_[12]$", "", x)        # 去掉末尾 _1 或 _2
+  return(x)
+}
+
+get_seq_type <- function(run, bioproject) {
+  run_clean <- clean_run(run)
+  project_dir <- file.path(rawfastq_dir, bioproject)
+
+  if (!dir.exists(project_dir)) {
+    return("not_found_project")
+  }
+
+  fq_files <- list.files(
+    project_dir,
+    pattern = "\\.fastq\\.gz$",
+    full.names = FALSE
+  )
+
+  # 匹配两种情况：
+  # 1. DRR732894.fastq.gz 这种 single
+  # 2. ITSS2_1.fastq.gz / ITSS2_2.fastq.gz 这种 paired
+  pattern_single <- paste0("^", run_clean, "\\.fastq\\.gz$")
+  pattern_pair   <- paste0("^", run_clean, "_[12]\\.fastq\\.gz$")
+
+  matched <- fq_files[
+    grepl(pattern_single, fq_files) |
+      grepl(pattern_pair, fq_files)
+  ]
+
+  n <- length(matched)
+
+  if (n == 1) {
+    return("single")
+  } else if (n == 2) {
+    return("paired")
+  } else if (n == 0) {
+    return("not_found")
+  } else {
+    return(paste0("unexpected_", n))
+  }
+}
+
+metadata$single_paired <- mapply(
+  get_seq_type,
+  metadata$Run,
+  metadata$BioProject
+)
+
+output_file <- "/mnt/d/PRJmetadata/metadata_valid_with_single_paired.csv"
+
+write.csv(metadata, output_file, row.names = FALSE, quote = TRUE)
+
+cat("完成！输出文件：", output_file, "\n\n")
+cat("统计结果：\n")
+print(table(metadata$single_paired))
+#然后在 WSL 里运行：
+Rscript add_single_paired.R
