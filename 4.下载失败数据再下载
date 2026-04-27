@@ -184,3 +184,265 @@ done < "$RUN_LIST"
 #运行：
 chmod +x /mnt/d/ITS/retry_failed_with_aspera.sh
 bash /mnt/d/ITS/retry_failed_with_aspera.sh
+#把下面这个脚本保存成/mnt/d/ITS/retry_md5fail_with_https.sh：
+mkdir -p /mnt/d/ITS
+nano /mnt/d/ITS/retry_md5fail_with_https.sh
+#脚本内容如下：
+#!/usr/bin/env bash
+set -u
+set -o pipefail
+
+RUN_LIST="/mnt/d/ITS/retry_lists/retry_runs_md5fail.txt"
+OUT_ROOT="/mnt/d/ITS/rawfastq"
+LOG_DIR="${OUT_ROOT}/logs_retry_https"
+
+mkdir -p "$OUT_ROOT" "$LOG_DIR"
+
+DOWNLOAD_LOG="${LOG_DIR}/download.log"
+FAIL_LOG="${LOG_DIR}/failed.log"
+SUCCESS_LOG="${LOG_DIR}/success.log"
+
+touch "$DOWNLOAD_LOG" "$FAIL_LOG" "$SUCCESS_LOG"
+
+timestamp() {
+  date "+%F %T"
+}
+
+fetch_ena_info() {
+  local run="$1"
+  curl -fsSL "https://www.ebi.ac.uk/ena/portal/api/filereport?accession=${run}&result=read_run&fields=run_accession,study_accession,fastq_ftp,fastq_md5&format=tsv" 2>/dev/null
+}
+
+download_one_file() {
+  local ftp_path="$1"
+  local expected_md5="$2"
+  local out_dir="$3"
+  local project="$4"
+  local run="$5"
+
+  local url="https://${ftp_path}"
+  local filename
+  filename="$(basename "$ftp_path")"
+  local outfile="${out_dir}/${filename}"
+
+  if [ -f "$outfile" ]; then
+    local local_md5
+    local_md5="$(md5sum "$outfile" | awk '{print $1}')"
+    if [ "$local_md5" = "$expected_md5" ]; then
+      echo "$(timestamp) [SKIP_OK] ${project} ${run} ${filename}" | tee -a "$SUCCESS_LOG"
+      return 0
+    else
+      rm -rf "$outfile"
+    fi
+  fi
+
+  echo "$(timestamp) [DOWNLOADING] ${project} ${run} ${filename}" | tee -a "$DOWNLOAD_LOG"
+
+  curl -L --fail --retry 3 --retry-delay 5 -o "$outfile" "$url"
+  local rc=$?
+
+  if [ $rc -ne 0 ]; then
+    echo "$(timestamp) [DOWNLOAD_FAIL] ${project} ${run} ${filename}" | tee -a "$FAIL_LOG"
+    rm -rf "$outfile"
+    return 1
+  fi
+
+  if [ ! -f "$outfile" ]; then
+    echo "$(timestamp) [MISSING_AFTER_DOWNLOAD] ${project} ${run} ${filename}" | tee -a "$FAIL_LOG"
+    return 1
+  fi
+
+  local got_md5
+  got_md5="$(md5sum "$outfile" | awk '{print $1}')"
+
+  if [ "$got_md5" = "$expected_md5" ]; then
+    echo "$(timestamp) [OK] ${project} ${run} ${filename}" | tee -a "$SUCCESS_LOG"
+  else
+    echo "$(timestamp) [MD5_FAIL] ${project} ${run} ${filename} expected=${expected_md5} got=${got_md5}" | tee -a "$FAIL_LOG"
+    rm -rf "$outfile"
+  fi
+}
+
+while IFS= read -r run || [ -n "$run" ]; do
+  run="$(echo "$run" | xargs)"
+  [ -z "$run" ] && continue
+
+  tsv="$(fetch_ena_info "$run")"
+  line="$(echo "$tsv" | tail -n +2 | head -n 1)"
+
+  if [ -z "$line" ]; then
+    echo "$(timestamp) [ENA_QUERY_FAIL] UNKNOWN ${run}" | tee -a "$FAIL_LOG"
+    continue
+  fi
+
+  IFS=$'\t' read -r run_accession study_accession fastq_ftp fastq_md5 <<< "$line"
+
+  if [ -z "${fastq_ftp:-}" ] || [ -z "${fastq_md5:-}" ] || [ -z "${study_accession:-}" ]; then
+    echo "$(timestamp) [NO_FASTQ_INFO] ${study_accession:-UNKNOWN} ${run}" | tee -a "$FAIL_LOG"
+    continue
+  fi
+
+  out_dir="${OUT_ROOT}/${study_accession}"
+  mkdir -p "$out_dir"
+
+  IFS=';' read -r -a paths <<< "$fastq_ftp"
+  IFS=';' read -r -a md5s <<< "$fastq_md5"
+
+  for ((i=0; i<${#paths[@]}; i++)); do
+    download_one_file "${paths[$i]}" "${md5s[$i]}" "$out_dir" "$study_accession" "$run" || true
+  done
+done < "$RUN_LIST"
+#然后运行：
+bash /mnt/d/ITS/retry_md5fail_with_https.sh
+#把下面这个脚本保存成/mnt/d/ITS/check_enaquery_runs.sh：
+mkdir -p /mnt/d/ITS
+nano /mnt/d/ITS/check_enaquery_runs.sh
+#脚本内容如下：
+#!/usr/bin/env bash
+set -euo pipefail
+
+RUN_LIST="/mnt/d/ITS/retry_lists/retry_runs_enaquery.txt"
+OUT_DIR="/mnt/d/ITS/retry_lists/enaquery_check"
+
+mkdir -p "$OUT_DIR"
+
+FOUND_FILE="${OUT_DIR}/enaquery_found.txt"
+NOT_FOUND_FILE="${OUT_DIR}/enaquery_not_found.txt"
+NO_FASTQ_FILE="${OUT_DIR}/enaquery_no_fastq.txt"
+DETAIL_TSV="${OUT_DIR}/enaquery_details.tsv"
+
+: > "$FOUND_FILE"
+: > "$NOT_FOUND_FILE"
+: > "$NO_FASTQ_FILE"
+
+echo -e "run_accession\tstudy_accession\tfastq_ftp\tfastq_aspera\tfastq_md5" > "$DETAIL_TSV"
+
+fetch_ena_info() {
+  local run="$1"
+  curl -fsSL "https://www.ebi.ac.uk/ena/portal/api/filereport?accession=${run}&result=read_run&fields=run_accession,study_accession,fastq_ftp,fastq_aspera,fastq_md5&format=tsv" 2>/dev/null
+}
+
+while IFS= read -r run || [ -n "$run" ]; do
+  run="$(echo "$run" | xargs)"
+  [ -z "$run" ] && continue
+
+  tsv="$(fetch_ena_info "$run" || true)"
+  line="$(echo "$tsv" | tail -n +2 | head -n 1)"
+
+  if [ -z "$line" ]; then
+    echo "$run" >> "$NOT_FOUND_FILE"
+    continue
+  fi
+
+  IFS=$'\t' read -r run_accession study_accession fastq_ftp fastq_aspera fastq_md5 <<< "$line"
+
+  if [ -z "${fastq_ftp:-}" ] && [ -z "${fastq_aspera:-}" ]; then
+    echo "$run" >> "$NO_FASTQ_FILE"
+    echo -e "${run_accession}\t${study_accession}\t${fastq_ftp}\t${fastq_aspera}\t${fastq_md5}" >> "$DETAIL_TSV"
+    continue
+  fi
+
+  echo "$run" >> "$FOUND_FILE"
+  echo -e "${run_accession}\t${study_accession}\t${fastq_ftp}\t${fastq_aspera}\t${fastq_md5}" >> "$DETAIL_TSV"
+
+done < "$RUN_LIST"
+
+sort -u "$FOUND_FILE" -o "$FOUND_FILE"
+sort -u "$NOT_FOUND_FILE" -o "$NOT_FOUND_FILE"
+sort -u "$NO_FASTQ_FILE" -o "$NO_FASTQ_FILE"
+
+echo "检查完成。输出文件："
+ls -lh "$OUT_DIR"
+#运行：
+bash /mnt/d/ITS/check_enaquery_runs.sh
+#跑完后会生成：
+#D:\ITS\retry_lists\enaquery_check\enaquery_found.txt
+#D:\ITS\retry_lists\enaquery_check\enaquery_not_found.txt
+#D:\ITS\retry_lists\enaquery_check\enaquery_no_fastq.txt
+#D:\ITS\retry_lists\enaquery_check\enaquery_details.tsv
+#结果是：
+#enaquery_found.txt：87
+#enaquery_not_found.txt：0
+#enaquery_no_fastq.txt：0
+#这说明最后这批 ENA_QUERY_FAIL 其实只是当时查询接口临时没返回，现在已经全部能查到了。
+#先备份原来的：
+cp /mnt/d/ITS/retry_lists/retry_runs_aspera.txt /mnt/d/ITS/retry_lists/retry_runs_aspera_backup.txt
+#然后用新的 found 清单覆盖：
+cp /mnt/d/ITS/retry_lists/enaquery_check/enaquery_found.txt /mnt/d/ITS/retry_lists/retry_runs_aspera.txt
+#再跑一遍你已经验证过可用的补下载脚本：
+bash /mnt/d/ITS/retry_failed_with_aspera.sh
+#把下面这个脚本保存成/mnt/d/ITS/check_final_completeness.sh：
+mkdir -p /mnt/d/ITS
+nano /mnt/d/ITS/check_final_completeness.sh
+#脚本内容如下：
+#!/usr/bin/env bash
+set -euo pipefail
+
+LIST_DIR="/mnt/d/SRR_Acc_List"
+RAW_DIR="/mnt/d/ITS/rawfastq"
+OUT_DIR="/mnt/d/ITS/final_check"
+
+mkdir -p "$OUT_DIR"
+
+MISSING_FILE="${OUT_DIR}/missing_runs.txt"
+PRESENT_FILE="${OUT_DIR}/present_runs.txt"
+SUMMARY_FILE="${OUT_DIR}/summary.tsv"
+
+: > "$MISSING_FILE"
+: > "$PRESENT_FILE"
+echo -e "project\ttotal_runs\truns_present\truns_missing" > "$SUMMARY_FILE"
+
+shopt -s nullglob
+
+for listfile in "${LIST_DIR}"/*_SRR_Acc_List.txt; do
+  base="$(basename "$listfile")"
+  project="${base%_SRR_Acc_List.txt}"
+  project_dir="${RAW_DIR}/${project}"
+
+  total_runs=0
+  runs_present=0
+  runs_missing=0
+
+  while IFS= read -r run || [ -n "$run" ]; do
+    run="$(echo "$run" | tr -d '\r' | xargs)"
+    [ -z "$run" ] && continue
+
+    total_runs=$((total_runs + 1))
+
+    matches=("${project_dir}/${run}.fastq.gz" "${project_dir}/${run}"_*.fastq.gz)
+
+    found=0
+    for f in "${matches[@]}"; do
+      if [ -f "$f" ]; then
+        found=1
+        break
+      fi
+    done
+
+    if [ $found -eq 1 ]; then
+      runs_present=$((runs_present + 1))
+      echo -e "${project}\t${run}" >> "$PRESENT_FILE"
+    else
+      runs_missing=$((runs_missing + 1))
+      echo -e "${project}\t${run}" >> "$MISSING_FILE"
+    fi
+  done < "$listfile"
+
+  echo -e "${project}\t${total_runs}\t${runs_present}\t${runs_missing}" >> "$SUMMARY_FILE"
+done
+
+echo "检查完成："
+ls -lh "$OUT_DIR"
+#运行：
+bash /mnt/d/ITS/check_final_completeness.sh
+mkdir -p /mnt/d/ITS/rawfastq/PRJCA004877
+#下载CRA004093
+/home/budixin/.aspera/connect/bin/ascp \
+  -P 33001 \
+  -i /mnt/c/Users/hp/Downloads/aspera01.openssh \
+  -QT \
+  -l 100m \
+  -k 1 \
+  -d \
+  aspera01@download.cncb.ac.cn:gsa/CRA004093 \
+  /mnt/d/ITS/rawfastq/PRJCA004877
