@@ -1,0 +1,157 @@
+cd /mnt/d/ITS/rawfastq/PRJNA630991
+#一次性统计每个 .fastq.gz 的 总 reads、R1 数、R2 数、Other 数，并标记是否可能有问题
+for f in *.fastq.gz
+do
+  zcat "$f" | awk -v file="$f" '
+  NR%4==1{
+    total++;
+
+    if ($0 ~ /\/1$/ || $2 ~ /\/1$/) {
+      r1++;
+    } else if ($0 ~ /\/2$/ || $2 ~ /\/2$/) {
+      r2++;
+    } else {
+      other++;
+    }
+  }
+  END{
+    status="OK";
+    if (r1>0 && r2>0 && r1!=r2) status="R1_R2_UNEQUAL";
+    else if (r1>0 && r2==0) status="ONLY_R1";
+    else if (r1==0 && r2>0) status="ONLY_R2";
+    else if (other>0) status="CHECK_HEADER";
+
+    printf "%-35s total=%-8d R1=%-8d R2=%-8d other=%-8d %s\n", file, total, r1+0, r2+0, other+0, status;
+  }'
+done
+#建议再检查 _1/_2 成对文件的 reads 数是否相等。运行这个：
+for r1 in *_1.fastq.gz
+do
+  base=${r1%_1.fastq.gz}
+  r2="${base}_2.fastq.gz"
+
+  if [ -f "$r2" ]; then
+    n1=$(zcat "$r1" | awk 'END{print NR/4}')
+    n2=$(zcat "$r2" | awk 'END{print NR/4}')
+
+    if [ "$n1" = "$n2" ]; then
+      status="PAIR_OK"
+    else
+      status="PAIR_UNEQUAL"
+    fi
+
+    printf "%-25s R1=%-8s R2=%-8s %s\n" "$base" "$n1" "$n2" "$status"
+  else
+    echo "$base missing _2 file"
+  fi
+done
+#这些 status=OK 的单个 .fastq.gz 是 interleaved paired-end FASTQ，也就是 R1/R2 在同一个文件里。既然 R1 和 R2 数量相等，就可以拆成标准的 _1.fastq.gz 和 _2.fastq.gz。
+#在当前目录运行：
+cd /mnt/d/ITS/rawfastq/PRJNA630991
+
+for f in *.fastq.gz
+do
+  # 跳过已经拆好的 _1/_2 文件
+  [[ "$f" == *_1.fastq.gz || "$f" == *_2.fastq.gz ]] && continue
+
+  base=${f%.fastq.gz}
+
+  echo "Splitting $f ..."
+
+  zcat "$f" | awk -v r1="${base}_1.fastq" -v r2="${base}_2.fastq" '
+  NR%4==1{
+    h=$0
+    getline s
+    getline p
+    getline q
+
+    if (h ~ /\/1$/) {
+      print h"\n"s"\n"p"\n"q >> r1
+    } else if (h ~ /\/2$/) {
+      print h"\n"s"\n"p"\n"q >> r2
+    } else {
+      print "Cannot classify header: " h > "/dev/stderr"
+    }
+  }'
+
+  gzip "${base}_1.fastq" "${base}_2.fastq"
+done
+#拆完后检查 _1/_2 reads 数是否相等：
+for r1 in *_1.fastq.gz
+do
+  base=${r1%_1.fastq.gz}
+  r2="${base}_2.fastq.gz"
+
+  if [ -f "$r2" ]; then
+    n1=$(zcat "$r1" | awk 'END{print NR/4}')
+    n2=$(zcat "$r2" | awk 'END{print NR/4}')
+
+    if [ "$n1" = "$n2" ]; then
+      status="PAIR_OK"
+    else
+      status="PAIR_UNEQUAL"
+    fi
+
+    printf "%-20s R1=%-8s R2=%-8s %s\n" "$base" "$n1" "$n2" "$status"
+  fi
+done
+#用下面这套命令。它会做两件事：
+#1.删除只有 _1.fastq.gz、没有对应 _2.fastq.gz 的文件。
+#2.把已经成功拆成 _1/_2 的原始单个 .fastq.gz 移动到目标文献文件夹。
+#先进入你的数据目录：
+cd /mnt/d/ITS/rawfastq/PRJNA630991
+#设置目标文件夹路径：
+target="/mnt/d/动物肠道真菌研究文献/Exploration of the effects of altitude change on bacteria and fungi in the rumen of yak (Bos grunniens)"
+#先预览将要删除哪些“只有 _1 的文件”：
+for r1 in *_1.fastq.gz
+do
+  base=${r1%_1.fastq.gz}
+  r2="${base}_2.fastq.gz"
+
+  if [ ! -f "$r2" ]; then
+    echo "Will delete: $r1"
+  fi
+done
+#确认没问题后再真正删除：
+for r1 in *_1.fastq.gz
+do
+  base=${r1%_1.fastq.gz}
+  r2="${base}_2.fastq.gz"
+
+  if [ ! -f "$r2" ]; then
+    rm "$r1"
+    echo "Deleted: $r1"
+  fi
+done
+#然后预览将要移动哪些原始单个 .fastq.gz 文件：
+for f in *.fastq.gz
+do
+  # 跳过已经拆出来的 _1/_2 文件
+  [[ "$f" == *_1.fastq.gz || "$f" == *_2.fastq.gz ]] && continue
+
+  base=${f%.fastq.gz}
+
+  if [ -f "${base}_1.fastq.gz" ] && [ -f "${base}_2.fastq.gz" ]; then
+    echo "Will move: $f"
+  fi
+done
+#确认没问题后再真正移动：
+mkdir -p "$target"
+
+for f in *.fastq.gz
+do
+  # 跳过已经拆出来的 _1/_2 文件
+  [[ "$f" == *_1.fastq.gz || "$f" == *_2.fastq.gz ]] && continue
+
+  base=${f%.fastq.gz}
+
+  if [ -f "${base}_1.fastq.gz" ] && [ -f "${base}_2.fastq.gz" ]; then
+    mv "$f" "$target/"
+    echo "Moved: $f"
+  fi
+done
+#执行完后，你的 PRJNA630991 文件夹里应该主要保留标准双端文件：
+#SRRxxxx_1.fastq.gzSRRxxxx_2.fastq.gz
+#而已经拆分成功的原始 interleaved 文件，例如：
+#SRR12546129.fastq.gzSRR12546130.fastq.gz...
+#会被移动到文献文件夹中保存备份。
