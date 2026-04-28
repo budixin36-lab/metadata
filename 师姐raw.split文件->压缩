@@ -1,0 +1,13 @@
+mkdir -p "/mnt/d/ITS/rawfastq/Liyangzhe_2021_ITS2"
+
+cd "/mnt/d/BaiduNetdiskDownload/MJ20210208017.liyangzhe.ITS3F_ITS4R.45samples.data/rawData/eachsample"
+
+for f in *.fq; do
+    gzip -c "$f" > "/mnt/d/ITS/rawfastq/Liyangzhe_2021_ITS2/${f%.fq}.fastq.gz"
+done
+#把文件名里raw.split.删掉
+cd "/mnt/d/ITS/rawfastq/Liyangzhe_2021_ITS2"
+
+for f in raw.split.*.fastq.gz; do
+    mv "$f" "${f#raw.split.}"
+done
