@@ -1,0 +1,82 @@
+#1.对于PairedEndSequences
+#清单文件manifest.txt列出样本、文件和读取方向，示例：
+#sample-id,absolute-filepath,direction
+#sample1,$PWD/sample1_r1.fastq.gz,forward
+#sample1,$PWD/sample1_r2.fastq.gz,reverse
+#sample2,$PWD/sample2_r1.fastq.gz,forward
+#sample2,$PWD/sample2_r2.fastq.gz,reverse
+#如果遇到问题，可以将$PWD变量补全路径替换为直接路径
+#将数据导入 QIIME
+qiime tools import \
+  --type SampleData[PairedEndSequencesWithQuality] \
+  --input-format PairedEndFastqManifestPhred33\
+  --input-path manifest.txt \
+  --output-path sequences.qza
+#通过运行 summarize 命令来查看数据的质量
+qiime demux summarize \
+  --i-data sequences.qza \
+  --o-visualization sequences.qzv
+#使用ITSxpress修剪ITS样本，可以调整`--p-cluster-id`参数的值，该参数用于指定聚类读取序列的序列一致性百分比，范围为[0.995-1.0]，设置为1可实现精确去冗余
+qiime itsxpress trim-pair-output-unmerged \
+  --i-per-sample-sequences sequences.qza \
+  --p-region ITS2 \
+  --p-taxa F \
+  --p-cluster-id 1.0 \
+  --p-threads 16 \
+  --o-trimmed trimmed_exact.qza
+#修剪后的序列使用Dada2的denoise-paired命令导入。由于Vsearch已经处理了合并和质量问题，因此无需进一步修剪或截断reads。将截断长度设置为0，因为数据质量良好
+qiime dada2 denoise-paired \
+  --i-demultiplexed-seqs trimmed_exact.qza \
+  --p-trunc-len-r 0 \
+  --p-trunc-len-f 0 \
+  --output-dir dada2out
+#输出：
+# dada2out/denoising_stats.qza
+# dada2out/representative_sequences.qza
+# dada2out/table.qza
+#汇总数据以供目视检查：
+qiime feature-table summarize \
+  --i-table dada2out/table.qza \
+  --o-visualization tableviz.qzv
+#对序列变异进行分类
+qiime feature-classifier classify-
+sklearn \
+  --i-classifier classifier.qza \
+  --i-reads dada2out/representative_sequences.qza \
+  --o-classification taxonomy.qza
+#将结果汇总，以便在 QIIME 2 查看器中进行可视化
+qiime metadata tabulate \
+  --m-input-file taxonomy.qza \
+  --o-visualization taxonomy.qzv
+#2.示例 Pacbio 数据
+#清单文件manifest.txt列出样本、文件和读取方向，示例：
+#sample-id,absolute-filepath,direction
+#S1,$PWD/pacbio/pacbio_samp1_reformat.fastq.gz,forward
+#导入序列数据
+#注意：Pacbio 提供的 fastq 文件已使用 bbmap reformat.sh 将 Pacbio 评分格式转换为 Illumina 评分格式：
+reformat.sh in=./pacbio/pacbio_samp1.fastq.gz out=pacbio_samp1_reformat.fastq.gz mincalledquality=2 maxcalledquality=41 qin=33
+
+qiime tools import \
+--input-path ./pacbio/manifest_pacbio.txt \
+--input-format SingleEndFastqManifestPhred33 \
+--type SampleData[SequencesWithQuality] \
+--output-path ./pacbio/sequences_pacbio.qza
+#运行 summarize 命令来查看数据的质量
+qiime demux summarize   \
+--i-data ./pacbio/sequences_pacbio.qza   \
+--o-visualization ./pacbio/sequences_pacbio.qzv
+#由于Pacbio长程测序可以扩增整个ITS1/5.8S/ITS2区域，因此可以将下面的--p-region命令中的ITS1、ITS2和ALL更改为相应的区域
+qiime itsxpress trim-single \
+--i-per-sample-sequences ./pacbio/sequences_pacbio.qza \
+--p-region ITS2 \
+--p-taxa F \
+--p-cluster-id 1.0 \
+--p-threads 16 \
+--o-trimmed ./pacbio/trimmed_pacbio.qza
+#修剪后的序列可以直接使用 Dada2 的 denoise-single 命令导入
+qiime dada2 denoise-single \
+--i-demultiplexed-seqs ./pacbio/trimmed_pacbio.qza \
+--p-trunc-len 0 \
+--p-n-threads 16 \
+--p-max-ee 20 \
+--output-dir ./pacbio/dada2out
