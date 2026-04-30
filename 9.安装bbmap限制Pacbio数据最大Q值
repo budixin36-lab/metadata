@@ -1,0 +1,179 @@
+#1. 在 WSL conda 环境安装 bbmap
+#建议新建一个小环境，避免污染 QIIME2 环境：
+conda create -n bbmap_env -c conda-forge -c bioconda bbmap -y
+conda activate bbmap_env
+#先解决 bbmap 安装失败，在 WSL 终端运行：
+conda clean -a -y
+#然后临时不用清华镜像，直接从官方 conda-forge / bioconda 安装：
+conda create -n bbmap_env \
+  --override-channels \
+  -c conda-forge -c bioconda \
+  bbmap -y
+  #按下面步骤修
+#1. 先看 conda 配置来源
+conda config --show-sources
+conda config --show channel_alias
+conda config --show channels
+#2. 临时绕过镜像，直接用官方完整 URL 安装
+#先清理失败环境：
+conda env remove -n bbmap_env -y
+conda clean -a -y
+#然后用完整 URL 创建环境：
+conda create -n bbmap_env \
+  -c https://conda.anaconda.org/conda-forge \
+  -c https://conda.anaconda.org/bioconda \
+  bbmap -y
+#如果成功：
+conda activate bbmap_env
+which reformat.sh
+reformat.sh --help | head
+#3.安装成功后进入你的数据文件夹
+cd /mnt/d/ITS/rawfastq/PRJNA1085887
+ls -lh *.fastq.gz | head
+#然后检查一个文件的质量值：
+zcat SRR28278754_subreads.fastq.gz | awk 'NR%4==0' | head -n 10000 | \
+python3 -c '
+import sys
+mn=999
+mx=-1
+for line in sys.stdin:
+    line=line.rstrip()
+    if not line:
+        continue
+    vals=[ord(c) for c in line]
+    mn=min(mn,min(vals))
+    mx=max(mx,max(vals))
+print("ASCII min:", mn, "ASCII max:", mx)
+print("Phred33 min:", mn-33, "Phred33 max:", mx-33)
+'
+#我的 PacBio FASTQ 是 Phred33 编码，但质量值最高到 Q93，明显高于 Illumina 常见范围 Q41
+#所以如果后续要按QIIME2/ITSxpress教程处理，建议用bbmap reformat.sh把质量值限制到Illumina范围。不是把编码改成Phred64，而是保留Phred33，并把最大Q值cap到41。
+#先对单个文件测试：
+reformat.sh \
+  in=SRR28278754_subreads.fastq.gz \
+  out=SRR28278754_subreads_reformat.fastq.gz \
+  mincalledquality=2 \
+  maxcalledquality=41 \
+  qin=33 \
+  qout=33
+#然后检查转换后的质量值：
+zcat SRR28278754_subreads_reformat.fastq.gz | awk 'NR%4==0' | head -n 10000 | \
+python3 -c '
+import sys
+mn=999
+mx=-1
+for line in sys.stdin:
+    line=line.rstrip()
+    if not line:
+        continue
+    vals=[ord(c) for c in line]
+    mn=min(mn,min(vals))
+    mx=max(mx,max(vals))
+print("ASCII min:", mn, "ASCII max:", mx)
+print("Phred33 min:", mn-33, "Phred33 max:", mx-33)
+'
+#mincalledquality=2 生效了，但 maxcalledquality=41 没有把最高质量值压到 41
+#建议直接用一个小 Python 脚本做 FASTQ 质量值封顶，更可控。
+#1. 单个文件重新封顶到 Q2–Q41
+#在当前目录运行：
+python3 - <<'PY'
+import gzip
+
+inp = "SRR28278754_subreads.fastq.gz"
+out = "SRR28278754_subreads_q2q41.fastq.gz"
+
+qmin = 2
+qmax = 41
+offset = 33
+
+with gzip.open(inp, "rt") as fin, gzip.open(out, "wt") as fout:
+    while True:
+        h = fin.readline()
+        if not h:
+            break
+        seq = fin.readline()
+        plus = fin.readline()
+        qual = fin.readline().rstrip("\n\r")
+
+        newqual = "".join(
+            chr(min(max(ord(c) - offset, qmin), qmax) + offset)
+            for c in qual
+        )
+
+        fout.write(h)
+        fout.write(seq)
+        fout.write(plus)
+        fout.write(newqual + "\n")
+
+print("Done:", out)
+PY
+#然后检查：
+#2. 确认序列数没有变化
+echo "原始文件 reads:"
+zcat SRR28278754_subreads.fastq.gz | echo $(( $(wc -l) / 4 ))
+
+echo "封顶后 reads:"
+zcat SRR28278754_subreads_q2q41.fastq.gz | echo $(( $(wc -l) / 4 ))
+#3. 单个文件确认没问题后，批量处理全部文件
+#先新建输出文件夹：
+mkdir -p ../PRJNA1085887_q2q41
+#批量处理：
+python3 - <<'PY'
+import gzip
+from pathlib import Path
+
+qmin = 2
+qmax = 41
+offset = 33
+
+outdir = Path("../PRJNA1085887_q2q41")
+outdir.mkdir(exist_ok=True)
+
+for inp in sorted(Path(".").glob("*_subreads.fastq.gz")):
+    out = outdir / inp.name.replace(".fastq.gz", "_q2q41.fastq.gz")
+    print("Processing", inp, "->", out)
+
+    with gzip.open(inp, "rt") as fin, gzip.open(out, "wt") as fout:
+        while True:
+            h = fin.readline()
+            if not h:
+                break
+            seq = fin.readline()
+            plus = fin.readline()
+            qual = fin.readline().rstrip("\n\r")
+
+            newqual = "".join(
+                chr(min(max(ord(c) - offset, qmin), qmax) + offset)
+                for c in qual
+            )
+
+            fout.write(h)
+            fout.write(seq)
+            fout.write(plus)
+            fout.write(newqual + "\n")
+
+print("All done.")
+PY
+#4. 批量检查转换结果
+cd ../PRJNA1085887_q2q41
+
+for f in *.fastq.gz
+do
+  echo "===== $f ====="
+  zcat "$f" | awk 'NR%4==0' | head -n 10000 | \
+  python3 -c '
+import sys
+mn=999
+mx=-1
+for line in sys.stdin:
+    line=line.rstrip()
+    if not line:
+        continue
+    vals=[ord(c) for c in line]
+    mn=min(mn,min(vals))
+    mx=max(mx,max(vals))
+print("Phred33 min:", mn-33, "Phred33 max:", mx-33)
+'
+done
+#每个文件都应该显示：
+#Phred33 min: 2 Phred33 max: 41
