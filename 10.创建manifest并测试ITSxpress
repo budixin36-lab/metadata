@@ -1,0 +1,607 @@
+#在 WSL 里运行：
+conda activate qiime2-amplicon-2026.1
+#1.建目录并复制 metadata
+cd /mnt/d
+
+mkdir -p ITS_SH_pipeline/{metadata,manifests,qza,trimmed_export,scripts,logs,results,reference,tmp}
+mkdir -p ITS_SH_pipeline/manifests/test
+
+cp /mnt/d/PRJmetadata/metadata_valid.csv /mnt/d/ITS_SH_pipeline/metadata/
+
+cd /mnt/d/ITS_SH_pipeline
+#检查 metadata 是否复制成功：
+ls -lh metadata/
+head metadata/metadata_valid.csv
+#2. 生成 manifest 脚本
+#运行：
+nano scripts/01_make_qiime_manifests.py
+#把下面脚本粘进去：
+import os
+import re
+import pandas as pd
+from pathlib import Path
+
+metadata_path = Path("metadata/metadata_valid.csv")
+raw_dir = Path("/mnt/d/ITS/rawfastq")
+out_dir = Path("manifests")
+out_dir.mkdir(exist_ok=True)
+
+df = pd.read_csv(metadata_path, dtype=str)
+
+required_cols = ["sampleid", "BioProject", "single_paired", "amplified_region"]
+missing_cols = [c for c in required_cols if c not in df.columns]
+if missing_cols:
+    raise SystemExit(f"Missing columns in metadata: {missing_cols}\nAvailable columns: {list(df.columns)}")
+
+df["sampleid"] = df["sampleid"].astype(str)
+df["BioProject"] = df["BioProject"].astype(str)
+df["single_paired"] = df["single_paired"].astype(str).str.lower()
+df["amplified_region"] = df["amplified_region"].astype(str).str.upper()
+
+fastqs = []
+for pattern in ["*.fastq.gz", "*.fq.gz", "*.fastq", "*.fq"]:
+    fastqs.extend(raw_dir.rglob(pattern))
+fastqs = [str(x) for x in fastqs]
+
+print(f"Found FASTQ files: {len(fastqs)}")
+
+def basename_no_ext(path):
+    name = os.path.basename(path)
+    name = re.sub(r"\.fastq\.gz$|\.fq\.gz$|\.fastq$|\.fq$", "", name, flags=re.I)
+    return name
+
+def find_fastqs_for_sample(sampleid, bioproject):
+    candidates = [f for f in fastqs if f"/{bioproject}/" in f]
+    if not candidates:
+        candidates = fastqs
+
+    hits = [f for f in candidates if sampleid in basename_no_ext(f)]
+
+    r1_hits = [
+        f for f in hits
+        if re.search(r"(_R?1($|[^0-9])|_1($|[^0-9])|\.R?1($|[^0-9])|\.1($|[^0-9])|forward|fwd)", basename_no_ext(f), re.I)
+    ]
+    r2_hits = [
+        f for f in hits
+        if re.search(r"(_R?2($|[^0-9])|_2($|[^0-9])|\.R?2($|[^0-9])|\.2($|[^0-9])|reverse|rev)", basename_no_ext(f), re.I)
+    ]
+
+    return sorted(hits), sorted(r1_hits), sorted(r2_hits)
+
+paired_records = {r: [] for r in ["ITS1", "ITS2", "ALL"]}
+single_records = {r: [] for r in ["ITS1", "ITS2", "ALL"]}
+missing = []
+
+for _, row in df.iterrows():
+    sid = row["sampleid"]
+    bp = row["BioProject"]
+    layout = row["single_paired"]
+    region = row["amplified_region"]
+
+    if region not in ["ITS1", "ITS2", "ALL"]:
+        missing.append({**row.to_dict(), "reason": f"unknown region {region}"})
+        continue
+
+    hits, r1_hits, r2_hits = find_fastqs_for_sample(sid, bp)
+
+    if layout == "paired":
+        if len(r1_hits) >= 1 and len(r2_hits) >= 1:
+            paired_records[region].append({
+                "sample-id": sid,
+                "forward-absolute-filepath": r1_hits[0],
+                "reverse-absolute-filepath": r2_hits[0]
+            })
+        else:
+            missing.append({**row.to_dict(), "reason": f"paired fastq not found; hits={len(hits)}"})
+    elif layout == "single":
+        if len(hits) >= 1:
+            single_records[region].append({
+                "sample-id": sid,
+                "absolute-filepath": sorted(hits)[0],
+                "direction": "forward"
+            })
+        else:
+            missing.append({**row.to_dict(), "reason": "single fastq not found"})
+    else:
+        missing.append({**row.to_dict(), "reason": f"unknown layout {layout}"})
+
+for region, records in paired_records.items():
+    out = out_dir / f"manifest_paired_{region}.tsv"
+    pd.DataFrame(records).to_csv(out, sep="\t", index=False)
+
+for region, records in single_records.items():
+    out = out_dir / f"manifest_single_{region}.tsv"
+    pd.DataFrame(records).to_csv(out, sep="\t", index=False)
+
+pd.DataFrame(missing).to_csv(out_dir / "missing_or_problem_samples.tsv", sep="\t", index=False)
+
+print("Manifest summary:")
+for region in ["ITS1", "ITS2", "ALL"]:
+    print(f"paired {region}: {len(paired_records[region])}")
+for region in ["ITS1", "ITS2", "ALL"]:
+    print(f"single {region}: {len(single_records[region])}")
+print(f"missing/problem: {len(missing)}")
+#保存退出：按 Ctrl+O，回车，再 Ctrl+X。
+#3. 运行 manifest 生成脚本
+python scripts/01_make_qiime_manifests.py
+#然后看结果：
+wc -l manifests/*.tsv
+head manifests/manifest_paired_ITS2.tsv
+head manifests/missing_or_problem_samples.tsv
+#现在的 manifest 有一个严重小 bug，需要先修正：有些样本的 R1 和 R2 被识别成同一个文件了。
+#1. 替换 manifest 生成脚本，运行：
+nano scripts/01_make_qiime_manifests.py
+#把原脚本全部删掉，换成下面这个更稳的版本：
+import os
+import re
+import pandas as pd
+from pathlib import Path
+
+metadata_path = Path("metadata/metadata_valid.csv")
+raw_dir = Path("/mnt/d/ITS/rawfastq")
+out_dir = Path("manifests")
+out_dir.mkdir(exist_ok=True)
+
+df = pd.read_csv(metadata_path, dtype=str)
+
+required_cols = ["sampleid", "BioProject", "single_paired", "amplified_region"]
+missing_cols = [c for c in required_cols if c not in df.columns]
+if missing_cols:
+    raise SystemExit(f"Missing columns in metadata: {missing_cols}\nAvailable columns: {list(df.columns)}")
+
+df["sampleid"] = df["sampleid"].astype(str)
+df["BioProject"] = df["BioProject"].astype(str)
+df["single_paired"] = df["single_paired"].astype(str).str.lower()
+df["amplified_region"] = df["amplified_region"].astype(str).str.upper()
+
+fastqs = []
+for pattern in ["*.fastq.gz", "*.fq.gz", "*.fastq", "*.fq"]:
+    fastqs.extend(raw_dir.rglob(pattern))
+fastqs = [str(x) for x in fastqs]
+
+print(f"Found FASTQ files: {len(fastqs)}")
+
+def basename_no_ext(path):
+    name = os.path.basename(path)
+    name = re.sub(r"\.fastq\.gz$|\.fq\.gz$|\.fastq$|\.fq$", "", name, flags=re.I)
+    return name
+
+def read_direction_from_suffix(sampleid, filepath):
+    """
+    只在 sampleid 后面的后缀里判断 R1/R2，避免 HJ19_2 这种样本名被误识别成 R2。
+    """
+    base = basename_no_ext(filepath)
+
+    if sampleid not in base:
+        return None
+
+    suffix = base.split(sampleid, 1)[1]
+
+    # 常见形式：
+    # sample.1 / sample.2
+    # sample_1 / sample_2
+    # sample_R1 / sample_R2
+    # sample_R1_001 / sample_R2_001
+    # sample.forward / sample.reverse
+    if re.search(r"(^|[._-])R?1($|[._-])", suffix, re.I):
+        return "R1"
+    if re.search(r"(^|[._-])R?2($|[._-])", suffix, re.I):
+        return "R2"
+    if re.search(r"(forward|fwd)", suffix, re.I):
+        return "R1"
+    if re.search(r"(reverse|rev)", suffix, re.I):
+        return "R2"
+
+    return None
+
+def find_fastqs_for_sample(sampleid, bioproject):
+    candidates = [f for f in fastqs if f"/{bioproject}/" in f]
+    if not candidates:
+        candidates = fastqs
+
+    # 要求文件名包含 sampleid
+    hits = [f for f in candidates if sampleid in basename_no_ext(f)]
+
+    r1_hits = []
+    r2_hits = []
+    unknown_hits = []
+
+    for f in hits:
+        direction = read_direction_from_suffix(sampleid, f)
+        if direction == "R1":
+            r1_hits.append(f)
+        elif direction == "R2":
+            r2_hits.append(f)
+        else:
+            unknown_hits.append(f)
+
+    return sorted(hits), sorted(r1_hits), sorted(r2_hits), sorted(unknown_hits)
+
+paired_records = {r: [] for r in ["ITS1", "ITS2", "ALL"]}
+single_records = {r: [] for r in ["ITS1", "ITS2", "ALL"]}
+missing = []
+duplicate_or_suspicious = []
+
+for _, row in df.iterrows():
+    sid = row["sampleid"]
+    bp = row["BioProject"]
+    layout = row["single_paired"]
+    region = row["amplified_region"]
+
+    if region not in ["ITS1", "ITS2", "ALL"]:
+        missing.append({**row.to_dict(), "reason": f"unknown region {region}"})
+        continue
+
+    hits, r1_hits, r2_hits, unknown_hits = find_fastqs_for_sample(sid, bp)
+
+    if layout == "paired":
+        if len(r1_hits) >= 1 and len(r2_hits) >= 1:
+            r1 = r1_hits[0]
+            r2 = r2_hits[0]
+
+            if r1 == r2:
+                missing.append({**row.to_dict(), "reason": f"R1 and R2 identical: {r1}"})
+                continue
+
+            if len(r1_hits) > 1 or len(r2_hits) > 1:
+                duplicate_or_suspicious.append({
+                    "sampleid": sid,
+                    "BioProject": bp,
+                    "region": region,
+                    "r1_hits": ";".join(r1_hits),
+                    "r2_hits": ";".join(r2_hits),
+                    "unknown_hits": ";".join(unknown_hits)
+                })
+
+            paired_records[region].append({
+                "sample-id": sid,
+                "forward-absolute-filepath": r1,
+                "reverse-absolute-filepath": r2
+            })
+        else:
+            missing.append({
+                **row.to_dict(),
+                "reason": f"paired fastq not found correctly; hits={len(hits)}; R1={len(r1_hits)}; R2={len(r2_hits)}; unknown={len(unknown_hits)}"
+            })
+
+    elif layout == "single":
+        if len(hits) >= 1:
+            # single-end 文件如果有多个，先取第一个，同时记录
+            if len(hits) > 1:
+                duplicate_or_suspicious.append({
+                    "sampleid": sid,
+                    "BioProject": bp,
+                    "region": region,
+                    "r1_hits": "",
+                    "r2_hits": "",
+                    "unknown_hits": ";".join(hits)
+                })
+
+            single_records[region].append({
+                "sample-id": sid,
+                "absolute-filepath": sorted(hits)[0],
+                "direction": "forward"
+            })
+        else:
+            missing.append({**row.to_dict(), "reason": "single fastq not found"})
+    else:
+        missing.append({**row.to_dict(), "reason": f"unknown layout {layout}"})
+
+for region, records in paired_records.items():
+    out = out_dir / f"manifest_paired_{region}.tsv"
+    pd.DataFrame(records).to_csv(out, sep="\t", index=False)
+
+for region, records in single_records.items():
+    out = out_dir / f"manifest_single_{region}.tsv"
+    pd.DataFrame(records).to_csv(out, sep="\t", index=False)
+
+pd.DataFrame(missing).to_csv(out_dir / "missing_or_problem_samples.tsv", sep="\t", index=False)
+pd.DataFrame(duplicate_or_suspicious).to_csv(out_dir / "duplicate_or_suspicious_fastq_matches.tsv", sep="\t", index=False)
+
+print("Manifest summary:")
+for region in ["ITS1", "ITS2", "ALL"]:
+    print(f"paired {region}: {len(paired_records[region])}")
+for region in ["ITS1", "ITS2", "ALL"]:
+    print(f"single {region}: {len(single_records[region])}")
+print(f"missing/problem: {len(missing)}")
+print(f"duplicate/suspicious: {len(duplicate_or_suspicious)}")
+#保存退出后重新运行：
+python scripts/01_make_qiime_manifests.py
+#2. 检查 R1/R2 是否还相同，运行：
+awk -F'\t' 'NR>1 && $2==$3 {print}' manifests/manifest_paired_ITS1.tsv | head
+awk -F'\t' 'NR>1 && $2==$3 {print}' manifests/manifest_paired_ITS2.tsv | head
+#如果没有任何输出，说明这个问题修好了。
+#再看 HJ19_2：
+grep -w "HJ19_2" manifests/manifest_paired_ITS2.tsv
+grep -w "HJ20_2" manifests/manifest_paired_ITS2.tsv
+#正确结果应该类似：
+HJ19_2  ...HJ19_2.1.fastq.gz  ...HJ19_2.2.fastq.gz
+HJ20_2  ...HJ20_2.1.fastq.gz  ...HJ20_2.2.fastq.gz
+#脚本用的是“包含 sampleid”匹配，所以：
+#XJ19_1 会匹配到 XJ19_1，也会误匹配到 XJ19_10
+#YZ19_1 会误匹配到 YZ19_10、YZ19_11、YZ19_13...
+#我们把匹配规则改成“文件名必须以 sampleid 开头，且 sampleid 后面只能接 .1/.2/_1/_2/R1/R2 这类 read 标记”。
+#1. 修改 manifest 脚本中的 hits 匹配规则，打开脚本：
+nano scripts/01_make_qiime_manifests.py
+#然后按 Ctrl+K 多按几次，把里面旧内容删空。再把下面完整脚本粘进去：
+import os
+import re
+import pandas as pd
+from pathlib import Path
+
+metadata_path = Path("metadata/metadata_valid.csv")
+raw_dir = Path("/mnt/d/ITS/rawfastq")
+out_dir = Path("manifests")
+out_dir.mkdir(exist_ok=True)
+
+df = pd.read_csv(metadata_path, dtype=str)
+
+required_cols = ["sampleid", "BioProject", "single_paired", "amplified_region"]
+missing_cols = [c for c in required_cols if c not in df.columns]
+if missing_cols:
+    raise SystemExit(
+        f"Missing columns in metadata: {missing_cols}\n"
+        f"Available columns: {list(df.columns)}"
+    )
+
+df["sampleid"] = df["sampleid"].astype(str)
+df["BioProject"] = df["BioProject"].astype(str)
+df["single_paired"] = df["single_paired"].astype(str).str.lower()
+df["amplified_region"] = df["amplified_region"].astype(str).str.upper()
+
+fastqs = []
+for pattern in ["*.fastq.gz", "*.fq.gz", "*.fastq", "*.fq"]:
+    fastqs.extend(raw_dir.rglob(pattern))
+fastqs = [str(x) for x in fastqs]
+
+print(f"Found FASTQ files: {len(fastqs)}")
+
+
+def basename_no_ext(path):
+    name = os.path.basename(path)
+    name = re.sub(
+        r"\.fastq\.gz$|\.fq\.gz$|\.fastq$|\.fq$",
+        "",
+        name,
+        flags=re.I,
+    )
+    return name
+
+
+def is_exact_sample_fastq(sampleid, filepath):
+    """
+    文件名必须以 sampleid 开头，并且 sampleid 后面只能接 read 标记。
+    这样可以避免 XJ19_1 误匹配到 XJ19_10。
+    """
+    base = basename_no_ext(filepath)
+
+    if not base.startswith(sampleid):
+        return False
+
+    suffix = base[len(sampleid):]
+
+    # single-end 文件名刚好等于 sampleid
+    if suffix == "":
+        return True
+
+    # paired-end 常见后缀:
+    # .1, .2, _1, _2, -1, -2
+    # .R1, .R2, _R1, _R2
+    # _R1_001, _R2_001
+    # .forward, .reverse
+    pattern = r"^([._-](R?[12])([._-].*)?|[._-](forward|reverse|fwd|rev)([._-].*)?)$"
+    return re.match(pattern, suffix, re.I) is not None
+
+
+def read_direction_from_suffix(sampleid, filepath):
+    """
+    只看 sampleid 后面的后缀来判断 R1/R2。
+    例如：
+    HJ19_2.1.fastq.gz -> sampleid=HJ19_2, suffix=.1 -> R1
+    HJ19_2.2.fastq.gz -> sampleid=HJ19_2, suffix=.2 -> R2
+    """
+    base = basename_no_ext(filepath)
+
+    if not base.startswith(sampleid):
+        return None
+
+    suffix = base[len(sampleid):]
+
+    if re.search(r"(^|[._-])R?1($|[._-])", suffix, re.I):
+        return "R1"
+    if re.search(r"(^|[._-])R?2($|[._-])", suffix, re.I):
+        return "R2"
+    if re.search(r"(forward|fwd)", suffix, re.I):
+        return "R1"
+    if re.search(r"(reverse|rev)", suffix, re.I):
+        return "R2"
+
+    return None
+
+
+def find_fastqs_for_sample(sampleid, bioproject):
+    candidates = [f for f in fastqs if f"/{bioproject}/" in f]
+    if not candidates:
+        candidates = fastqs
+
+    hits = [f for f in candidates if is_exact_sample_fastq(sampleid, f)]
+
+    r1_hits = []
+    r2_hits = []
+    unknown_hits = []
+
+    for f in hits:
+        direction = read_direction_from_suffix(sampleid, f)
+        if direction == "R1":
+            r1_hits.append(f)
+        elif direction == "R2":
+            r2_hits.append(f)
+        else:
+            unknown_hits.append(f)
+
+    return sorted(hits), sorted(r1_hits), sorted(r2_hits), sorted(unknown_hits)
+
+
+paired_records = {r: [] for r in ["ITS1", "ITS2", "ALL"]}
+single_records = {r: [] for r in ["ITS1", "ITS2", "ALL"]}
+missing = []
+duplicate_or_suspicious = []
+
+for _, row in df.iterrows():
+    sid = row["sampleid"]
+    bp = row["BioProject"]
+    layout = row["single_paired"]
+    region = row["amplified_region"]
+
+    if region not in ["ITS1", "ITS2", "ALL"]:
+        missing.append({**row.to_dict(), "reason": f"unknown region {region}"})
+        continue
+
+    hits, r1_hits, r2_hits, unknown_hits = find_fastqs_for_sample(sid, bp)
+
+    if layout == "paired":
+        if len(r1_hits) >= 1 and len(r2_hits) >= 1:
+            r1 = r1_hits[0]
+            r2 = r2_hits[0]
+
+            if r1 == r2:
+                missing.append({**row.to_dict(), "reason": f"R1 and R2 identical: {r1}"})
+                continue
+
+            if len(r1_hits) > 1 or len(r2_hits) > 1:
+                duplicate_or_suspicious.append({
+                    "sampleid": sid,
+                    "BioProject": bp,
+                    "region": region,
+                    "r1_hits": ";".join(r1_hits),
+                    "r2_hits": ";".join(r2_hits),
+                    "unknown_hits": ";".join(unknown_hits),
+                })
+
+            paired_records[region].append({
+                "sample-id": sid,
+                "forward-absolute-filepath": r1,
+                "reverse-absolute-filepath": r2,
+            })
+
+        else:
+            missing.append({
+                **row.to_dict(),
+                "reason": (
+                    f"paired fastq not found correctly; "
+                    f"hits={len(hits)}; R1={len(r1_hits)}; "
+                    f"R2={len(r2_hits)}; unknown={len(unknown_hits)}"
+                ),
+            })
+
+    elif layout == "single":
+        if len(hits) >= 1:
+            if len(hits) > 1:
+                duplicate_or_suspicious.append({
+                    "sampleid": sid,
+                    "BioProject": bp,
+                    "region": region,
+                    "r1_hits": "",
+                    "r2_hits": "",
+                    "unknown_hits": ";".join(hits),
+                })
+
+            single_records[region].append({
+                "sample-id": sid,
+                "absolute-filepath": sorted(hits)[0],
+                "direction": "forward",
+            })
+
+        else:
+            missing.append({**row.to_dict(), "reason": "single fastq not found"})
+
+    else:
+        missing.append({**row.to_dict(), "reason": f"unknown layout {layout}"})
+
+
+for region, records in paired_records.items():
+    out = out_dir / f"manifest_paired_{region}.tsv"
+    pd.DataFrame(records).to_csv(out, sep="\t", index=False)
+
+for region, records in single_records.items():
+    out = out_dir / f"manifest_single_{region}.tsv"
+    pd.DataFrame(records).to_csv(out, sep="\t", index=False)
+
+pd.DataFrame(missing).to_csv(
+    out_dir / "missing_or_problem_samples.tsv",
+    sep="\t",
+    index=False,
+)
+
+pd.DataFrame(duplicate_or_suspicious).to_csv(
+    out_dir / "duplicate_or_suspicious_fastq_matches.tsv",
+    sep="\t",
+    index=False,
+)
+
+print("Manifest summary:")
+for region in ["ITS1", "ITS2", "ALL"]:
+    print(f"paired {region}: {len(paired_records[region])}")
+for region in ["ITS1", "ITS2", "ALL"]:
+    print(f"single {region}: {len(single_records[region])}")
+print(f"missing/problem: {len(missing)}")
+print(f"duplicate/suspicious: {len(duplicate_or_suspicious)}")
+#然后重新运行：
+python scripts/01_make_qiime_manifests.py
+#接着检查：
+cat manifests/duplicate_or_suspicious_fastq_matches.tsv
+
+grep -w "XJ19_1" manifests/manifest_paired_ITS2.tsv
+grep -w "XJ20_1" manifests/manifest_paired_ITS2.tsv
+grep -w "YZ19_1" manifests/manifest_paired_ITS2.tsv
+
+awk -F'\t' 'NR>1 && $2==$3 {print}' manifests/manifest_paired_ITS1.tsv | head
+awk -F'\t' 'NR>1 && $2==$3 {print}' manifests/manifest_paired_ITS2.tsv | head
+#现在 manifest 可以用了，下一步先做 5 个样本测试，不要直接跑全量。
+#1. 测试 paired ITS2
+mkdir -p manifests/test qza trimmed_export logs
+
+head -n 6 manifests/manifest_paired_ITS2.tsv > manifests/test/manifest_paired_ITS2_test5.tsv
+#导入：
+qiime tools import \
+  --type 'SampleData[PairedEndSequencesWithQuality]' \
+  --input-path manifests/test/manifest_paired_ITS2_test5.tsv \
+  --output-path qza/test_paired_ITS2_demux.qza \
+  --input-format PairedEndFastqManifestPhred33V2
+#运行 ITSxpress，线程用 4：
+qiime itsxpress trim-pair \
+  --i-per-sample-sequences qza/test_paired_ITS2_demux.qza \
+  --p-region ITS2 \
+  --p-taxa F \
+  --p-cluster-id 1.0 \
+  --p-threads 4 \
+  --o-trimmed qza/test_paired_ITS2_itsxpress.qza
+#导出：
+qiime tools export \
+  --input-path qza/test_paired_ITS2_itsxpress.qza \
+  --output-path trimmed_export/test_paired_ITS2
+#检查：
+find trimmed_export/test_paired_ITS2 -type f | head
+#2. 再测试 single ALL
+head -n 6 manifests/manifest_single_ALL.tsv > manifests/test/manifest_single_ALL_test5.tsv
+#导入：
+qiime tools import \
+  --type 'SampleData[SequencesWithQuality]' \
+  --input-path manifests/test/manifest_single_ALL_test5.tsv \
+  --output-path qza/test_single_ALL_demux.qza \
+  --input-format SingleEndFastqManifestPhred33V2
+#运行 ITSxpress：
+qiime itsxpress trim-single \
+  --i-per-sample-sequences qza/test_single_ALL_demux.qza \
+  --p-region ALL \
+  --p-taxa F \
+  --p-cluster-id 1.0 \
+  --p-threads 4 \
+  --o-trimmed qza/test_single_ALL_itsxpress.qza
+#导出：
+qiime tools export \
+  --input-path qza/test_single_ALL_itsxpress.qza \
+  --output-path trimmed_export/test_single_ALL
+#检查：
+find trimmed_export/test_single_ALL -type f | head
+#如果这两组都成功，我们再写全量脚本。
