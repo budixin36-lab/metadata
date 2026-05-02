@@ -605,3 +605,23 @@ qiime tools export \
 #检查：
 find trimmed_export/test_single_ALL -type f | head
 #如果这两组都成功，我们再写全量脚本。
+#现在可以删掉测试导出的文件：
+rm -rf trimmed_export/test_paired_ITS2 trimmed_export/test_single_ALL
+#甚至测试 .qza 也可以删掉：
+rm -f qza/test_paired_ITS2_demux.qza qza/test_paired_ITS2_itsxpress.qza
+rm -f qza/test_single_ALL_demux.qza qza/test_single_ALL_itsxpress.qza
+#流程应该改成：
+#manifest
+#→ import 成 demux.qza
+#→ ITSxpress 修剪成 itsxpress.qza
+#→ vsearch dereplicate-sequences
+#→ 保留 qza
+#→ 不导出 trimmed FASTQ
+#建议保留：
+#demux.qza：回看原始导入数据质量 / 样本情况
+#itsxpress.qza：回看修剪后数据
+#derep_table.qza：后续合并、过滤、SH mapping
+#derep_repseqs.qza：后续映射到 UNITE SH
+#你之前测试导出的 FASTQ 可以删
+rm -rf trimmed_export/test_paired_ITS2 trimmed_export/test_single_ALL
+#trimmed_export 这个文件夹后面不再用了。
