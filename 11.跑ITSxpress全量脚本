@@ -1,0 +1,220 @@
+#新建这个脚本：
+nano scripts/02_itsxpress_derep_keep_qza.sh
+#粘贴：
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+
+mkdir -p qza logs qzv
+
+run_paired () {
+    region=$1
+    manifest="manifests/manifest_paired_${region}.tsv"
+
+    demux="qza/paired_${region}_demux.qza"
+    trimmed="qza/paired_${region}_itsxpress.qza"
+    table="qza/paired_${region}_derep_table.qza"
+    repseqs="qza/paired_${region}_derep_repseqs.qza"
+
+    n=$(($(wc -l < "$manifest") - 1))
+    if [[ "$n" -le 0 ]]; then
+        echo "[SKIP] paired $region has no samples"
+        return
+    fi
+
+    echo "[IMPORT] paired $region, samples=$n"
+    if [[ ! -s "$demux" ]]; then
+        qiime tools import \
+          --type 'SampleData[PairedEndSequencesWithQuality]' \
+          --input-path "$manifest" \
+          --output-path "$demux" \
+          --input-format PairedEndFastqManifestPhred33V2 \
+          > "logs/import_paired_${region}.log" 2>&1
+    else
+        echo "[SKIP] $demux exists"
+    fi
+
+    echo "[SUMMARIZE DEMUX] paired $region"
+    if [[ ! -s "qzv/paired_${region}_demux.qzv" ]]; then
+        qiime demux summarize \
+          --i-data "$demux" \
+          --o-visualization "qzv/paired_${region}_demux.qzv" \
+          > "logs/summarize_demux_paired_${region}.log" 2>&1
+    fi
+
+    echo "[ITSxpress] paired $region"
+    if [[ ! -s "$trimmed" ]]; then
+        qiime itsxpress trim-pair \
+          --i-per-sample-sequences "$demux" \
+          --p-region "$region" \
+          --p-taxa F \
+          --p-cluster-id 1.0 \
+          --p-threads "$THREADS" \
+          --o-trimmed "$trimmed" \
+          > "logs/itsxpress_paired_${region}.log" 2>&1
+    else
+        echo "[SKIP] $trimmed exists"
+    fi
+
+    echo "[SUMMARIZE TRIMMED] paired $region"
+    if [[ ! -s "qzv/paired_${region}_itsxpress.qzv" ]]; then
+        qiime demux summarize \
+          --i-data "$trimmed" \
+          --o-visualization "qzv/paired_${region}_itsxpress.qzv" \
+          > "logs/summarize_itsxpress_paired_${region}.log" 2>&1
+    fi
+
+    echo "[DEREP] paired $region"
+    if [[ ! -s "$table" || ! -s "$repseqs" ]]; then
+        qiime vsearch dereplicate-sequences \
+          --i-sequences "$trimmed" \
+          --p-min-seq-length 1 \
+          --p-min-unique-size 1 \
+          --o-dereplicated-table "$table" \
+          --o-dereplicated-sequences "$repseqs" \
+          > "logs/derep_paired_${region}.log" 2>&1
+    else
+        echo "[SKIP] derep paired $region exists"
+    fi
+
+    echo "[SUMMARIZE DEREP TABLE] paired $region"
+    if [[ ! -s "qzv/paired_${region}_derep_table.qzv" ]]; then
+        qiime feature-table summarize \
+          --i-table "$table" \
+          --o-visualization "qzv/paired_${region}_derep_table.qzv" \
+          --m-sample-metadata-file metadata/metadata_valid.tsv \
+          > "logs/summarize_derep_table_paired_${region}.log" 2>&1 || \
+        qiime feature-table summarize \
+          --i-table "$table" \
+          --o-visualization "qzv/paired_${region}_derep_table.qzv" \
+          > "logs/summarize_derep_table_paired_${region}.log" 2>&1
+    fi
+
+    echo "[TABULATE REPSEQS] paired $region"
+    if [[ ! -s "qzv/paired_${region}_derep_repseqs.qzv" ]]; then
+        qiime feature-table tabulate-seqs \
+          --i-data "$repseqs" \
+          --o-visualization "qzv/paired_${region}_derep_repseqs.qzv" \
+          > "logs/tabulate_repseqs_paired_${region}.log" 2>&1
+    fi
+}
+
+run_single () {
+    region=$1
+    manifest="manifests/manifest_single_${region}.tsv"
+
+    demux="qza/single_${region}_demux.qza"
+    trimmed="qza/single_${region}_itsxpress.qza"
+    table="qza/single_${region}_derep_table.qza"
+    repseqs="qza/single_${region}_derep_repseqs.qza"
+
+    n=$(($(wc -l < "$manifest") - 1))
+    if [[ "$n" -le 0 ]]; then
+        echo "[SKIP] single $region has no samples"
+        return
+    fi
+
+    echo "[IMPORT] single $region, samples=$n"
+    if [[ ! -s "$demux" ]]; then
+        qiime tools import \
+          --type 'SampleData[SequencesWithQuality]' \
+          --input-path "$manifest" \
+          --output-path "$demux" \
+          --input-format SingleEndFastqManifestPhred33V2 \
+          > "logs/import_single_${region}.log" 2>&1
+    else
+        echo "[SKIP] $demux exists"
+    fi
+
+    echo "[SUMMARIZE DEMUX] single $region"
+    if [[ ! -s "qzv/single_${region}_demux.qzv" ]]; then
+        qiime demux summarize \
+          --i-data "$demux" \
+          --o-visualization "qzv/single_${region}_demux.qzv" \
+          > "logs/summarize_demux_single_${region}.log" 2>&1
+    fi
+
+    echo "[ITSxpress] single $region"
+    if [[ ! -s "$trimmed" ]]; then
+        qiime itsxpress trim-single \
+          --i-per-sample-sequences "$demux" \
+          --p-region "$region" \
+          --p-taxa F \
+          --p-cluster-id 1.0 \
+          --p-threads "$THREADS" \
+          --o-trimmed "$trimmed" \
+          > "logs/itsxpress_single_${region}.log" 2>&1
+    else
+        echo "[SKIP] $trimmed exists"
+    fi
+
+    echo "[SUMMARIZE TRIMMED] single $region"
+    if [[ ! -s "qzv/single_${region}_itsxpress.qzv" ]]; then
+        qiime demux summarize \
+          --i-data "$trimmed" \
+          --o-visualization "qzv/single_${region}_itsxpress.qzv" \
+          > "logs/summarize_itsxpress_single_${region}.log" 2>&1
+    fi
+
+    echo "[DEREP] single $region"
+    if [[ ! -s "$table" || ! -s "$repseqs" ]]; then
+        qiime vsearch dereplicate-sequences \
+          --i-sequences "$trimmed" \
+          --p-min-seq-length 1 \
+          --p-min-unique-size 1 \
+          --o-dereplicated-table "$table" \
+          --o-dereplicated-sequences "$repseqs" \
+          > "logs/derep_single_${region}.log" 2>&1
+    else
+        echo "[SKIP] derep single $region exists"
+    fi
+
+    echo "[SUMMARIZE DEREP TABLE] single $region"
+    if [[ ! -s "qzv/single_${region}_derep_table.qzv" ]]; then
+        qiime feature-table summarize \
+          --i-table "$table" \
+          --o-visualization "qzv/single_${region}_derep_table.qzv" \
+          --m-sample-metadata-file metadata/metadata_valid.tsv \
+          > "logs/summarize_derep_table_single_${region}.log" 2>&1 || \
+        qiime feature-table summarize \
+          --i-table "$table" \
+          --o-visualization "qzv/single_${region}_derep_table.qzv" \
+          > "logs/summarize_derep_table_single_${region}.log" 2>&1
+    fi
+
+    echo "[TABULATE REPSEQS] single $region"
+    if [[ ! -s "qzv/single_${region}_derep_repseqs.qzv" ]]; then
+        qiime feature-table tabulate-seqs \
+          --i-data "$repseqs" \
+          --o-visualization "qzv/single_${region}_derep_repseqs.qzv" \
+          > "logs/tabulate_repseqs_single_${region}.log" 2>&1
+    fi
+}
+
+# 先小组，再大组
+run_paired ALL
+run_single ALL
+
+run_paired ITS2
+run_single ITS2
+
+run_paired ITS1
+run_single ITS1
+
+echo "ITSxpress + derep + qzv summaries finished."
+#先把 metadata 转成 QIIME2 更喜欢的 TSV
+#因为你现在是 metadata_valid.csv，feature-table summarize 更稳妥用 TSV：
+python - <<'PY'
+import pandas as pd
+df = pd.read_csv("metadata/metadata_valid.csv", dtype=str)
+df = df.rename(columns={"sampleid": "sample-id"})
+df.to_csv("metadata/metadata_valid.tsv", sep="\t", index=False)
+PY
+#运行脚本
+chmod +x scripts/02_itsxpress_derep_keep_qza.sh
+bash scripts/02_itsxpress_derep_keep_qza.sh
+#跑完后我们再做：
+#合并 5 组 derep table + repseqs
+#→ 全局 filter singleton
+#→ UNITE SH mapping
