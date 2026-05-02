@@ -218,3 +218,83 @@ bash scripts/02_itsxpress_derep_keep_qza.sh
 #合并 5 组 derep table + repseqs
 #→ 全局 filter singleton
 #→ UNITE SH mapping
+
+#脚本在这里报错停了：No such option: --o-visualization
+#原因是QIIME2 2026.1 的 feature-table summarize 参数变了。
+#你现在的版本不再用：--o-visualization
+#而是要用：
+#--o-summary
+#--o-feature-frequencies
+#--o-sample-frequencies
+#1. 直接用 Python 自动修脚本，在/mnt/d/ITS_SH_pipeline下运行：
+python - <<'PY'
+from pathlib import Path
+
+p = Path("scripts/02_itsxpress_derep_keep_qza.sh")
+s = p.read_text()
+
+old_paired = '''qiime feature-table summarize \\
+          --i-table "$table" \\
+          --o-visualization "qzv/paired_${region}_derep_table.qzv" \\
+          --m-sample-metadata-file metadata/metadata_valid.tsv \\
+          > "logs/summarize_derep_table_paired_${region}.log" 2>&1 || \\
+        qiime feature-table summarize \\
+          --i-table "$table" \\
+          --o-visualization "qzv/paired_${region}_derep_table.qzv" \\
+          > "logs/summarize_derep_table_paired_${region}.log" 2>&1'''
+
+new_paired = '''qiime feature-table summarize \\
+          --i-table "$table" \\
+          --m-metadata-file metadata/metadata_valid.tsv \\
+          --o-feature-frequencies "qza/paired_${region}_feature_frequencies.qza" \\
+          --o-sample-frequencies "qza/paired_${region}_sample_frequencies.qza" \\
+          --o-summary "qzv/paired_${region}_derep_table.qzv" \\
+          > "logs/summarize_derep_table_paired_${region}.log" 2>&1 || \\
+        qiime feature-table summarize \\
+          --i-table "$table" \\
+          --o-feature-frequencies "qza/paired_${region}_feature_frequencies.qza" \\
+          --o-sample-frequencies "qza/paired_${region}_sample_frequencies.qza" \\
+          --o-summary "qzv/paired_${region}_derep_table.qzv" \\
+          > "logs/summarize_derep_table_paired_${region}.log" 2>&1'''
+
+old_single = '''qiime feature-table summarize \\
+          --i-table "$table" \\
+          --o-visualization "qzv/single_${region}_derep_table.qzv" \\
+          --m-sample-metadata-file metadata/metadata_valid.tsv \\
+          > "logs/summarize_derep_table_single_${region}.log" 2>&1 || \\
+        qiime feature-table summarize \\
+          --i-table "$table" \\
+          --o-visualization "qzv/single_${region}_derep_table.qzv" \\
+          > "logs/summarize_derep_table_single_${region}.log" 2>&1'''
+
+new_single = '''qiime feature-table summarize \\
+          --i-table "$table" \\
+          --m-metadata-file metadata/metadata_valid.tsv \\
+          --o-feature-frequencies "qza/single_${region}_feature_frequencies.qza" \\
+          --o-sample-frequencies "qza/single_${region}_sample_frequencies.qza" \\
+          --o-summary "qzv/single_${region}_derep_table.qzv" \\
+          > "logs/summarize_derep_table_single_${region}.log" 2>&1 || \\
+        qiime feature-table summarize \\
+          --i-table "$table" \\
+          --o-feature-frequencies "qza/single_${region}_feature_frequencies.qza" \\
+          --o-sample-frequencies "qza/single_${region}_sample_frequencies.qza" \\
+          --o-summary "qzv/single_${region}_derep_table.qzv" \\
+          > "logs/summarize_derep_table_single_${region}.log" 2>&1'''
+
+if old_paired not in s:
+    print("WARNING: paired block not found exactly")
+else:
+    s = s.replace(old_paired, new_paired)
+
+if old_single not in s:
+    print("WARNING: single block not found exactly")
+else:
+    s = s.replace(old_single, new_single)
+
+p.write_text(s)
+print("Updated:", p)
+PY
+#2. 确认脚本已经改好，运行：
+grep -n "feature-table summarize" -A8 scripts/02_itsxpress_derep_keep_qza.sh
+#3. 重新运行脚本，直接重新跑：
+bash scripts/02_itsxpress_derep_keep_qza.sh
