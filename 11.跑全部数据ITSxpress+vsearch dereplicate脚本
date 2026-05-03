@@ -298,3 +298,12 @@ PY
 grep -n "feature-table summarize" -A8 scripts/02_itsxpress_derep_keep_qza.sh
 #3. 重新运行脚本，直接重新跑：
 bash scripts/02_itsxpress_derep_keep_qza.sh
+#运行时先不用管 C 盘太多，偶尔另开一个 WSL 窗口看一下即可：
+df -h /
+df -h /mnt/d
+cd /mnt/d/ITS_SH_pipeline
+du -sh qza qzv logs tmp 2>/dev/null
+du -sh /tmp/qiime2* 2>/dev/null
+#等 paired ITS2 完成后运行：
+rm -rf /tmp/qiime2*
+ls -lh qza | grep paired_ITS2
