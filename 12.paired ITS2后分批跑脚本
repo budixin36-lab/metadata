@@ -1,0 +1,258 @@
+#现在要改策略，后面不要再对大型 derep table 做：
+#qiime feature-table summarize
+#也不要对大型 derep repseqs 做：
+#qiime feature-table tabulate-seqs
+#因为 derep 后 feature 太多，.qzv 会很容易爆内存。
+#我们保留这些可视化就够了：
+#demux.qzv          看导入前质量
+#itsxpress.qzv      看修剪后质量
+#derep 结果先不做 .qzv，等后面：
+#合并 → filter singleton → 映射到 UNITE SH
+#之后，feature 数会大幅下降，再对最终 SH_table.qza 做 summarize/barplot。
+#你现在的原脚本会继续在大表 summarize 处报错，所以先不用它。
+#接下来分两步：
+#A. 跑剩下的小组：single_ITS2、single_ITS1
+#B. paired_ITS1 用分批脚本跑
+#2.先建一个“小组继续处理脚本”
+#这个脚本处理：single_ITS2、single_ITS1
+#不处理大型 paired_ITS1，也不再 summarize derep table。
+nano scripts/03_run_remaining_single_groups.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+
+export TMPDIR="/tmp"
+export TMP="/tmp"
+export TEMP="/tmp"
+
+mkdir -p qza qzv logs
+
+run_single () {
+    region=$1
+    manifest="manifests/manifest_single_${region}.tsv"
+
+    demux="qza/single_${region}_demux.qza"
+    trimmed="qza/single_${region}_itsxpress.qza"
+    table="qza/single_${region}_derep_table.qza"
+    repseqs="qza/single_${region}_derep_repseqs.qza"
+
+    n=$(($(wc -l < "$manifest") - 1))
+    if [[ "$n" -le 0 ]]; then
+        echo "[SKIP] single $region has no samples"
+        return
+    fi
+
+    echo "[IMPORT] single $region, samples=$n"
+    if [[ ! -s "$demux" ]]; then
+        qiime tools import \
+          --type 'SampleData[SequencesWithQuality]' \
+          --input-path "$manifest" \
+          --output-path "$demux" \
+          --input-format SingleEndFastqManifestPhred33V2 \
+          > "logs/import_single_${region}.log" 2>&1
+    else
+        echo "[SKIP] $demux exists"
+    fi
+
+    echo "[SUMMARIZE DEMUX] single $region"
+    if [[ ! -s "qzv/single_${region}_demux.qzv" ]]; then
+        qiime demux summarize \
+          --i-data "$demux" \
+          --o-visualization "qzv/single_${region}_demux.qzv" \
+          > "logs/summarize_demux_single_${region}.log" 2>&1
+    fi
+
+    echo "[ITSxpress] single $region"
+    if [[ ! -s "$trimmed" ]]; then
+        qiime itsxpress trim-single \
+          --i-per-sample-sequences "$demux" \
+          --p-region "$region" \
+          --p-taxa F \
+          --p-cluster-id 1.0 \
+          --p-threads "$THREADS" \
+          --o-trimmed "$trimmed" \
+          > "logs/itsxpress_single_${region}.log" 2>&1
+    else
+        echo "[SKIP] $trimmed exists"
+    fi
+
+    echo "[SUMMARIZE TRIMMED] single $region"
+    if [[ ! -s "qzv/single_${region}_itsxpress.qzv" ]]; then
+        qiime demux summarize \
+          --i-data "$trimmed" \
+          --o-visualization "qzv/single_${region}_itsxpress.qzv" \
+          > "logs/summarize_itsxpress_single_${region}.log" 2>&1
+    fi
+
+    echo "[DEREP] single $region"
+    if [[ ! -s "$table" || ! -s "$repseqs" ]]; then
+        qiime vsearch dereplicate-sequences \
+          --i-sequences "$trimmed" \
+          --p-min-seq-length 1 \
+          --p-min-unique-size 1 \
+          --o-dereplicated-table "$table" \
+          --o-dereplicated-sequences "$repseqs" \
+          > "logs/derep_single_${region}.log" 2>&1
+    else
+        echo "[SKIP] derep single $region exists"
+    fi
+
+    echo "[DONE] single $region"
+}
+
+run_single ITS2
+rm -rf /tmp/qiime2*
+
+run_single ITS1
+rm -rf /tmp/qiime2*
+
+echo "Remaining single groups finished."
+#保存后运行：
+chmod +x scripts/03_run_remaining_single_groups.sh
+bash scripts/03_run_remaining_single_groups.sh
+#完成后检查：
+ls -lh qza | grep single_ITS
+du -sh qza qzv logs
+rm -rf /tmp/qiime2*
+#3. paired_ITS1 必须分批跑
+#paired_ITS2 1170 个样本的 demux 是 15G。
+#paired_ITS1 有 2446 个样本，如果一次性跑，很可能生成 30G 以上的 demux，加上 /tmp/qiime2 临时文件，会比较危险。
+#所以 paired_ITS1 建议每批 300 个样本。
+#3.1 拆分 paired_ITS1 manifest
+mkdir -p manifests/batches/paired_ITS1
+
+python - <<'PY'
+from pathlib import Path
+
+manifest = Path("manifests/manifest_paired_ITS1.tsv")
+outdir = Path("manifests/batches/paired_ITS1")
+outdir.mkdir(parents=True, exist_ok=True)
+
+batch_size = 300
+
+lines = manifest.read_text().splitlines()
+header = lines[0]
+rows = lines[1:]
+
+for i in range(0, len(rows), batch_size):
+    batch_no = i // batch_size + 1
+    out = outdir / f"manifest_paired_ITS1_batch{batch_no:02d}.tsv"
+    out.write_text("\n".join([header] + rows[i:i+batch_size]) + "\n")
+
+print(f"Total samples: {len(rows)}")
+print(f"Batch size: {batch_size}")
+print(f"Batches: {(len(rows) + batch_size - 1) // batch_size}")
+PY
+#查看：
+wc -l manifests/batches/paired_ITS1/*.tsv
+#3.2 新建 paired_ITS1 分批脚本
+nano scripts/04_run_paired_ITS1_batches.sh
+#粘贴：
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+
+export TMPDIR="/tmp"
+export TMP="/tmp"
+export TEMP="/tmp"
+
+mkdir -p qza qzv logs
+
+for manifest in manifests/batches/paired_ITS1/manifest_paired_ITS1_batch*.tsv
+do
+    batch=$(basename "$manifest" .tsv)
+    batch=${batch#manifest_}
+
+    demux="qza/${batch}_demux.qza"
+    trimmed="qza/${batch}_itsxpress.qza"
+    table="qza/${batch}_derep_table.qza"
+    repseqs="qza/${batch}_derep_repseqs.qza"
+
+    n=$(($(wc -l < "$manifest") - 1))
+    echo "========================================"
+    echo "[BATCH] $batch, samples=$n"
+    echo "========================================"
+
+    echo "[IMPORT] $batch"
+    if [[ ! -s "$demux" ]]; then
+        qiime tools import \
+          --type 'SampleData[PairedEndSequencesWithQuality]' \
+          --input-path "$manifest" \
+          --output-path "$demux" \
+          --input-format PairedEndFastqManifestPhred33V2 \
+          > "logs/import_${batch}.log" 2>&1
+    else
+        echo "[SKIP] $demux exists"
+    fi
+
+    echo "[SUMMARIZE DEMUX] $batch"
+    if [[ ! -s "qzv/${batch}_demux.qzv" ]]; then
+        qiime demux summarize \
+          --i-data "$demux" \
+          --o-visualization "qzv/${batch}_demux.qzv" \
+          > "logs/summarize_demux_${batch}.log" 2>&1
+    fi
+
+    echo "[ITSxpress] $batch"
+    if [[ ! -s "$trimmed" ]]; then
+        qiime itsxpress trim-pair \
+          --i-per-sample-sequences "$demux" \
+          --p-region ITS1 \
+          --p-taxa F \
+          --p-cluster-id 1.0 \
+          --p-threads "$THREADS" \
+          --o-trimmed "$trimmed" \
+          > "logs/itsxpress_${batch}.log" 2>&1
+    else
+        echo "[SKIP] $trimmed exists"
+    fi
+
+    echo "[SUMMARIZE TRIMMED] $batch"
+    if [[ ! -s "qzv/${batch}_itsxpress.qzv" ]]; then
+        qiime demux summarize \
+          --i-data "$trimmed" \
+          --o-visualization "qzv/${batch}_itsxpress.qzv" \
+          > "logs/summarize_itsxpress_${batch}.log" 2>&1
+    fi
+
+    echo "[DEREP] $batch"
+    if [[ ! -s "$table" || ! -s "$repseqs" ]]; then
+        qiime vsearch dereplicate-sequences \
+          --i-sequences "$trimmed" \
+          --p-min-seq-length 1 \
+          --p-min-unique-size 1 \
+          --o-dereplicated-table "$table" \
+          --o-dereplicated-sequences "$repseqs" \
+          > "logs/derep_${batch}.log" 2>&1
+    else
+        echo "[SKIP] derep $batch exists"
+    fi
+
+    echo "[CLEAN BIG INTERMEDIATE] $batch"
+    # demux 是最大文件，可由 manifest + 原始 FASTQ 重建；删除节省空间
+    rm -f "$demux"
+
+    # itsxpress.qza 如果你想保留修剪后数据，可以注释掉下一行。
+    # 但为了省空间，这里默认保留，不删。
+    # rm -f "$trimmed"
+
+    rm -rf /tmp/qiime2*
+
+    echo "[DONE] $batch"
+    du -sh qza qzv logs 2>/dev/null
+done
+
+echo "paired ITS1 batches finished."
+#保存后运行：
+chmod +x scripts/04_run_paired_ITS1_batches.sh
+bash scripts/04_run_paired_ITS1_batches.sh
+#4. 运行时怎么监控
+#另开一个 WSL 窗口：
+cd /mnt/d/ITS_SH_pipeline
+
+du -sh qza qzv logs 2>/dev/null
+du -sh /tmp/qiime2* 2>/dev/null
+df -h /mnt/d
+#Windows C 盘如果低于 25G，再停下来清理。
