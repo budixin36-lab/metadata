@@ -256,3 +256,145 @@ du -sh qza qzv logs 2>/dev/null
 du -sh /tmp/qiime2* 2>/dev/null
 df -h /mnt/d
 #Windows C 盘如果低于 25G，再停下来清理。
+
+#这里有两个问题：
+#拆分 manifest 的 Python 缩进错了，所以只生成了最后一个 batch09，只有 46 个样本。
+#wc -l manifests/batches/paired_ITS1/*.tsv
+#47 manifests/batches/paired_ITS1/manifest_paired_ITS1_batch09.tsv
+#说明前 8 个 batch 没生成。
+#04_run_paired_ITS1_batches.sh 脚本粘贴也出错了，所以才会：
+#syntax error near unexpected token `done'
+#1. 删除错误的 batch manifest
+rm -rf manifests/batches/paired_ITS1
+mkdir -p manifests/batches/paired_ITS1
+#2. 重新正确拆分 paired_ITS1 manifest
+python - <<'PY'
+from pathlib import Path
+
+manifest = Path("manifests/manifest_paired_ITS1.tsv")
+outdir = Path("manifests/batches/paired_ITS1")
+outdir.mkdir(parents=True, exist_ok=True)
+
+batch_size = 300
+
+lines = manifest.read_text().splitlines()
+header = lines[0]
+rows = lines[1:]
+
+for i in range(0, len(rows), batch_size):
+    batch_no = i // batch_size + 1
+    out = outdir / f"manifest_paired_ITS1_batch{batch_no:02d}.tsv"
+    out.write_text("\n".join([header] + rows[i:i+batch_size]) + "\n")
+
+print(f"Total samples: {len(rows)}")
+print(f"Batch size: {batch_size}")
+print(f"Batches: {(len(rows) + batch_size - 1) // batch_size}")
+PY
+#然后检查：
+wc -l manifests/batches/paired_ITS1/*.tsv
+#3. 删除旧的错误脚本，重新写完整 batch 脚本
+rm -f scripts/04_run_paired_ITS1_batches.sh
+nano scripts/04_run_paired_ITS1_batches.sh
+#把下面完整内容粘进去：
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+
+export TMPDIR="/tmp"
+export TMP="/tmp"
+export TEMP="/tmp"
+
+mkdir -p qza qzv logs
+
+for manifest in manifests/batches/paired_ITS1/manifest_paired_ITS1_batch*.tsv
+do
+    batch=$(basename "$manifest" .tsv)
+    batch=${batch#manifest_}
+
+    demux="qza/${batch}_demux.qza"
+    trimmed="qza/${batch}_itsxpress.qza"
+    table="qza/${batch}_derep_table.qza"
+    repseqs="qza/${batch}_derep_repseqs.qza"
+
+    n=$(($(wc -l < "$manifest") - 1))
+
+    echo "========================================"
+    echo "[BATCH] $batch, samples=$n"
+    echo "========================================"
+
+    echo "[IMPORT] $batch"
+    if [[ ! -s "$demux" ]]; then
+        qiime tools import \
+          --type 'SampleData[PairedEndSequencesWithQuality]' \
+          --input-path "$manifest" \
+          --output-path "$demux" \
+          --input-format PairedEndFastqManifestPhred33V2 \
+          > "logs/import_${batch}.log" 2>&1
+    else
+        echo "[SKIP] $demux exists"
+    fi
+
+    echo "[SUMMARIZE DEMUX] $batch"
+    if [[ ! -s "qzv/${batch}_demux.qzv" ]]; then
+        qiime demux summarize \
+          --i-data "$demux" \
+          --o-visualization "qzv/${batch}_demux.qzv" \
+          > "logs/summarize_demux_${batch}.log" 2>&1
+    else
+        echo "[SKIP] qzv/${batch}_demux.qzv exists"
+    fi
+
+    echo "[ITSxpress] $batch"
+    if [[ ! -s "$trimmed" ]]; then
+        qiime itsxpress trim-pair \
+          --i-per-sample-sequences "$demux" \
+          --p-region ITS1 \
+          --p-taxa F \
+          --p-cluster-id 1.0 \
+          --p-threads "$THREADS" \
+          --o-trimmed "$trimmed" \
+          > "logs/itsxpress_${batch}.log" 2>&1
+    else
+        echo "[SKIP] $trimmed exists"
+    fi
+
+    echo "[SUMMARIZE TRIMMED] $batch"
+    if [[ ! -s "qzv/${batch}_itsxpress.qzv" ]]; then
+        qiime demux summarize \
+          --i-data "$trimmed" \
+          --o-visualization "qzv/${batch}_itsxpress.qzv" \
+          > "logs/summarize_itsxpress_${batch}.log" 2>&1
+    else
+        echo "[SKIP] qzv/${batch}_itsxpress.qzv exists"
+    fi
+
+    echo "[DEREP] $batch"
+    if [[ ! -s "$table" || ! -s "$repseqs" ]]; then
+        qiime vsearch dereplicate-sequences \
+          --i-sequences "$trimmed" \
+          --p-min-seq-length 1 \
+          --p-min-unique-size 1 \
+          --o-dereplicated-table "$table" \
+          --o-dereplicated-sequences "$repseqs" \
+          > "logs/derep_${batch}.log" 2>&1
+    else
+        echo "[SKIP] derep $batch exists"
+    fi
+
+    echo "[CLEAN BIG INTERMEDIATE] $batch"
+    rm -f "$demux"
+    rm -rf /tmp/qiime2*
+
+    echo "[DONE] $batch"
+    du -sh qza qzv logs 2>/dev/null
+
+done
+
+echo "paired ITS1 batches finished."
+#4. 检查脚本语法
+bash -n scripts/04_run_paired_ITS1_batches.sh
+#如果没有任何输出，说明语法没问题。
+#5. 运行 paired_ITS1 分批脚本
+chmod +x scripts/04_run_paired_ITS1_batches.sh
+bash scripts/04_run_paired_ITS1_batches.sh
