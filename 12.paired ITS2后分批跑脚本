@@ -527,3 +527,23 @@ chmod +x scripts/04_run_paired_ITS1_batches.sh
 bash -n scripts/04_run_paired_ITS1_batches.sh
 #4. 继续运行
 bash scripts/04_run_paired_ITS1_batches.sh
+#这是 batch08 里有一对 paired-end FASTQ 的 R1/R2 read 数不一致，所以 QIIME2 拒绝导入整个 batch08。
+#因为你后面不用 DADA2，而是 ITSxpress merge paired reads；R1/R2 数不一致会导致 paired-end 处理没法正常进行。
+#1. 记录问题样本
+mkdir -p metadata/problem_samples
+
+echo -e "sampleid\treason" >> metadata/problem_samples/excluded_paired_fastq_mismatch.tsv
+echo -e "SRR17629862\tR1/R2 record count mismatch: R1=318692, R2=320804" >> metadata/problem_samples/excluded_paired_fastq_mismatch.tsv
+#2. 从 batch08 manifest 中删除 SRR17629862，先备份：
+cp manifests/batches/paired_ITS1/manifest_paired_ITS1_batch08.tsv \
+   manifests/batches/paired_ITS1/manifest_paired_ITS1_batch08.tsv.bak
+#删除该样本：
+awk -F'\t' 'NR==1 || $1!="SRR17629862"' \
+  manifests/batches/paired_ITS1/manifest_paired_ITS1_batch08.tsv.bak \
+  > manifests/batches/paired_ITS1/manifest_paired_ITS1_batch08.tsv
+#确认删掉了：
+grep SRR17629862 manifests/batches/paired_ITS1/manifest_paired_ITS1_batch08.tsv
+wc -l manifests/batches/paired_ITS1/manifest_paired_ITS1_batch08.tsv
+#3. 清理临时文件，继续跑
+rm -rf /tmp/qiime2*
+bash scripts/04_run_paired_ITS1_batches.sh
