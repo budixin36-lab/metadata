@@ -100,13 +100,16 @@ tail -n 80 logs/merge_SH_tables.log
 tail -n 80 logs/filter_SH_min2.log
 #如果停在 summarize：
 tail -n 80 logs/summarize_merged_SH_min2.log
-#4. 成功后继续做 taxonomy barplot
-#如果 merged_SH_table_min2.qza 成功生成，就运行：
+#SH 总表已经成功生成：
+#qza/merged_SH_table.qza        # 未过滤低丰度 SH
+#qza/merged_SH_table_min2.qza   # 去掉总丰度 <2 的 SH
+#qzv/merged_SH_table_min2.qzv   # 可视化检查文件
+#1. 做 taxa barplot
 qiime taxa barplot \
   --i-table qza/merged_SH_table_min2.qza \
   --i-taxonomy qza/UNITE_SH_taxonomy.qza \
   --m-metadata-file metadata/metadata_valid.tsv \
   --o-visualization qzv/merged_SH_taxa_barplot.qzv
-#然后可以用 QIIME2 View 打开：
-qzv/merged_SH_table_min2.qzv
-qzv/merged_SH_taxa_barplot.qzv
+#内存不够，taxa barplot 被系统杀掉了
+#先清理临时文件
+rm -rf /tmp/qiime2*
