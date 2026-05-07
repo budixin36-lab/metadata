@@ -1,0 +1,151 @@
+#下一步我们做：
+#1. 合并所有 derep table
+#2. 合并所有 derep repseqs
+#3. 全局过滤 singleton
+#4. 同步过滤 repseqs
+#5. 生成 merged / no-singleton 的检查文件
+#先不做 UNITE SH mapping，先把合并结果做好。
+#1. 确认 derep 文件数量
+#应该看到大约 13 个 table 和 13 个 repseqs：
+#2. 新建合并脚本
+cat > scripts/05_merge_derep_filter_singletons.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+export TMPDIR="/tmp"
+export TMP="/tmp"
+export TEMP="/tmp"
+
+mkdir -p qza qzv logs results
+
+echo "========================================"
+echo "[CHECK] derep inputs"
+echo "========================================"
+
+TABLES=$(ls qza/*derep_table.qza | sort)
+REPSEQS=$(ls qza/*derep_repseqs.qza | sort)
+
+echo "Derep tables:"
+echo "$TABLES"
+echo
+echo "Derep repseqs:"
+echo "$REPSEQS"
+echo
+
+echo "Table count: $(echo "$TABLES" | wc -l)"
+echo "Repseq count: $(echo "$REPSEQS" | wc -l)"
+
+echo "========================================"
+echo "[MERGE TABLES]"
+echo "========================================"
+
+if [[ ! -s qza/merged_derep_table.qza ]]; then
+    cmd="qiime feature-table merge"
+    for t in $TABLES
+    do
+        cmd="$cmd --i-tables $t"
+    done
+    cmd="$cmd --o-merged-table qza/merged_derep_table.qza"
+    echo "$cmd" > logs/merge_tables.command.txt
+    eval "$cmd" > logs/merge_tables.log 2>&1
+else
+    echo "[SKIP] qza/merged_derep_table.qza exists"
+fi
+
+echo "========================================"
+echo "[MERGE REPSEQS]"
+echo "========================================"
+
+if [[ ! -s qza/merged_derep_repseqs.qza ]]; then
+    cmd="qiime feature-table merge-seqs"
+    for r in $REPSEQS
+    do
+        cmd="$cmd --i-data $r"
+    done
+    cmd="$cmd --o-merged-data qza/merged_derep_repseqs.qza"
+    echo "$cmd" > logs/merge_repseqs.command.txt
+    eval "$cmd" > logs/merge_repseqs.log 2>&1
+else
+    echo "[SKIP] qza/merged_derep_repseqs.qza exists"
+fi
+
+echo "========================================"
+echo "[FILTER GLOBAL SINGLETONS]"
+echo "========================================"
+
+if [[ ! -s qza/merged_derep_table_no_singleton.qza ]]; then
+    qiime feature-table filter-features \
+      --i-table qza/merged_derep_table.qza \
+      --p-min-frequency 2 \
+      --o-filtered-table qza/merged_derep_table_no_singleton.qza \
+      > logs/filter_global_singletons.log 2>&1
+else
+    echo "[SKIP] qza/merged_derep_table_no_singleton.qza exists"
+fi
+
+echo "========================================"
+echo "[FILTER REPSEQS TO NO-SINGLETON TABLE]"
+echo "========================================"
+
+if [[ ! -s qza/merged_derep_repseqs_no_singleton.qza ]]; then
+    qiime feature-table filter-seqs \
+      --i-data qza/merged_derep_repseqs.qza \
+      --i-table qza/merged_derep_table_no_singleton.qza \
+      --o-filtered-data qza/merged_derep_repseqs_no_singleton.qza \
+      > logs/filter_repseqs_no_singleton.log 2>&1
+else
+    echo "[SKIP] qza/merged_derep_repseqs_no_singleton.qza exists"
+fi
+
+echo "========================================"
+echo "[OPTIONAL LIGHT SUMMARIES]"
+echo "========================================"
+
+# 大表 summarize 可能爆内存，所以这里只对 filtered table 尝试 summarize。
+# 如果仍然爆内存，主流程不受影响。
+if [[ ! -s qzv/merged_derep_table_no_singleton.qzv ]]; then
+    qiime feature-table summarize \
+      --i-table qza/merged_derep_table_no_singleton.qza \
+      --o-feature-frequencies qza/merged_no_singleton_feature_frequencies.qza \
+      --o-sample-frequencies qza/merged_no_singleton_sample_frequencies.qza \
+      --o-summary qzv/merged_derep_table_no_singleton.qzv \
+      > logs/summarize_merged_no_singleton.log 2>&1 || \
+    echo "[WARNING] summarize merged no-singleton table failed; continuing."
+fi
+
+echo "========================================"
+echo "[DONE]"
+echo "========================================"
+
+ls -lh qza/merged_derep_table.qza
+ls -lh qza/merged_derep_repseqs.qza
+ls -lh qza/merged_derep_table_no_singleton.qza
+ls -lh qza/merged_derep_repseqs_no_singleton.qza
+
+rm -rf /tmp/qiime2*
+
+du -sh qza qzv logs results 2>/dev/null
+BASH
+
+chmod +x scripts/05_merge_derep_filter_singletons.sh
+#3. 先检查语法
+bash -n scripts/05_merge_derep_filter_singletons.sh
+#4. 运行合并和 singleton 过滤
+bash scripts/05_merge_derep_filter_singletons.sh
+#5. 如果中途报错，看对应日志
+#如果停在 merge table：
+tail -n 80 logs/merge_tables.log
+#如果停在 merge repseqs：
+tail -n 80 logs/merge_repseqs.log
+如果停在 filter singleton：
+tail -n 80 logs/filter_global_singletons.log
+#如果只是 summarize_merged_no_singleton.log 报内存错误，可以先不管，因为那只是 .qzv 可视化，不影响主流程。
+#6. 成功后你应该得到这 4 个关键文件
+#qza/merged_derep_table.qza
+#qza/merged_derep_repseqs.qza
+#qza/merged_derep_table_no_singleton.qza
+#qza/merged_derep_repseqs_no_singleton.qza
+#后面 UNITE SH mapping 会用：
+#qza/merged_derep_table_no_singleton.qza
+#qza/merged_derep_repseqs_no_singleton.qza
+#作为输入
