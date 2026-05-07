@@ -234,9 +234,105 @@ print(f"Samples: {len(rows)}")
 PY
 #运行：
 python scripts/09_calculate_SH_mapping_rate.py
-#查看结果：
+#Killed 是因为我上一版脚本把每个 BIOM 转成 TSV 后再用 pandas 读入了。你的 derep table feature 数太大，转 TSV / pandas 会变成非常大的矩阵，所以又被系统杀掉了。
+#改成低内存版本：直接读取 BIOM 的稀疏表，不转 TSV，不用 pandas 展开大矩阵。
+#先清理临时文件：
+rm -rf /tmp/qiime2*
+rm -rf results/tmp_mapping_rate
+#然后覆盖 mapping rate 脚本：
+cat > scripts/09_calculate_SH_mapping_rate_lowmem.py <<'PY'
+import subprocess
+import shutil
+from pathlib import Path
+
+import pandas as pd
+from biom import load_table
+
+qza_dir = Path("qza")
+results_dir = Path("results")
+tmp_dir = results_dir / "tmp_mapping_rate"
+results_dir.mkdir(exist_ok=True)
+tmp_dir.mkdir(exist_ok=True)
+
+rows = []
+
+def export_qza(qza_path, out_dir):
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    subprocess.run(
+        [
+            "qiime", "tools", "export",
+            "--input-path", str(qza_path),
+            "--output-path", str(out_dir)
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    biom_path = out_dir / "feature-table.biom"
+    if not biom_path.exists():
+        raise FileNotFoundError(f"Cannot find {biom_path}")
+    return biom_path
+
+def sample_sums_from_biom(biom_path):
+    table = load_table(str(biom_path))
+    sample_ids = list(table.ids(axis="sample"))
+    sums = table.sum(axis="sample")
+    return {sid: int(round(val)) for sid, val in zip(sample_ids, sums)}
+
+derep_tables = sorted(qza_dir.glob("*_derep_table.qza"))
+
+print(f"Found derep tables: {len(derep_tables)}")
+
+for derep_table in derep_tables:
+    base = derep_table.name.replace("_derep_table.qza", "")
+    sh_table = qza_dir / f"{base}_SH_table.qza"
+
+    if not sh_table.exists():
+        print(f"[SKIP] no SH table for {base}")
+        continue
+
+    print(f"[PROCESS] {base}")
+
+    total_export_dir = tmp_dir / f"{base}_total"
+    sh_export_dir = tmp_dir / f"{base}_SH"
+
+    total_biom = export_qza(derep_table, total_export_dir)
+    sh_biom = export_qza(sh_table, sh_export_dir)
+
+    total_counts = sample_sums_from_biom(total_biom)
+    matched_counts = sample_sums_from_biom(sh_biom)
+
+    for sampleid, total in total_counts.items():
+        matched = matched_counts.get(sampleid, 0)
+        rows.append({
+            "group": base,
+            "sampleid": sampleid,
+            "total_derep_reads": total,
+            "matched_to_UNITE_SH": matched,
+            "unmatched_reads": total - matched,
+            "mapping_rate": matched / total if total > 0 else 0,
+        })
+
+    shutil.rmtree(total_export_dir, ignore_errors=True)
+    shutil.rmtree(sh_export_dir, ignore_errors=True)
+
+out = results_dir / "SH_mapping_rate_by_sample.tsv"
+pd.DataFrame(rows).to_csv(out, sep="\t", index=False)
+
+shutil.rmtree(tmp_dir, ignore_errors=True)
+
+print(f"Wrote {out}")
+print(f"Samples: {len(rows)}")
+PY
+#运行：
+python scripts/09_calculate_SH_mapping_rate_lowmem.py
+#然后查看结果：
 head results/SH_mapping_rate_by_sample.tsv
-#看总体情况：
+#汇总 mapping rate：
 python - <<'PY'
 import pandas as pd
 
@@ -244,12 +340,12 @@ df = pd.read_csv("results/SH_mapping_rate_by_sample.tsv", sep="\t")
 
 print("Number of samples:", len(df))
 print()
+print("Overall mapping rate:")
 print(df["mapping_rate"].describe())
 print()
-print("Low mapping rate samples < 0.5:")
-print((df["mapping_rate"] < 0.5).sum())
+print("Samples with mapping_rate < 0.5:", (df["mapping_rate"] < 0.5).sum())
+print("Samples with mapping_rate < 0.2:", (df["mapping_rate"] < 0.2).sum())
 print()
 print("Mapping rate by group:")
 print(df.groupby("group")["mapping_rate"].describe())
 PY
-#如果多数样本 mapping rate 还可以，就可以继续后续分析
