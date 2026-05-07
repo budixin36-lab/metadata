@@ -1,0 +1,112 @@
+#下一步建议按这个顺序做：
+#1. 合并 13 个 SH_table
+#2. 过滤低丰度 SH，例如 min-frequency 2
+#3. 生成 SH_table 的 summarize qzv
+#4. 接上 UNITE_SH_taxonomy 做 taxa barplot
+#5. 统计 mapping rate，评估 matched / unmatched 情况
+#先做第 1–3 步：合并 SH 表。
+#1. 新建合并 SH table 脚本
+cd /mnt/d/ITS_SH_pipeline
+
+cat > scripts/08_merge_SH_tables.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+export TMPDIR="/tmp"
+export TMP="/tmp"
+export TEMP="/tmp"
+
+mkdir -p qza qzv logs results
+
+echo "========================================"
+echo "[MERGE SH TABLES]"
+echo "========================================"
+
+SH_TABLES=$(ls qza/*_SH_table.qza | sort)
+
+echo "$SH_TABLES"
+echo "SH table count: $(echo "$SH_TABLES" | wc -l)"
+
+if [[ ! -s qza/merged_SH_table.qza ]]; then
+    cmd="qiime feature-table merge"
+    for t in $SH_TABLES
+    do
+        cmd="$cmd --i-tables $t"
+    done
+    cmd="$cmd --o-merged-table qza/merged_SH_table.qza"
+    echo "$cmd" > logs/merge_SH_tables.command.txt
+    eval "$cmd" > logs/merge_SH_tables.log 2>&1
+else
+    echo "[SKIP] qza/merged_SH_table.qza exists"
+fi
+
+echo "========================================"
+echo "[FILTER LOW-FREQUENCY SH FEATURES]"
+echo "========================================"
+
+if [[ ! -s qza/merged_SH_table_min2.qza ]]; then
+    qiime feature-table filter-features \
+      --i-table qza/merged_SH_table.qza \
+      --p-min-frequency 2 \
+      --o-filtered-table qza/merged_SH_table_min2.qza \
+      > logs/filter_SH_min2.log 2>&1
+else
+    echo "[SKIP] qza/merged_SH_table_min2.qza exists"
+fi
+
+echo "========================================"
+echo "[SUMMARIZE SH TABLE]"
+echo "========================================"
+
+if [[ ! -s qzv/merged_SH_table_min2.qzv ]]; then
+    qiime feature-table summarize \
+      --i-table qza/merged_SH_table_min2.qza \
+      --m-metadata-file metadata/metadata_valid.tsv \
+      --o-feature-frequencies qza/merged_SH_min2_feature_frequencies.qza \
+      --o-sample-frequencies qza/merged_SH_min2_sample_frequencies.qza \
+      --o-summary qzv/merged_SH_table_min2.qzv \
+      > logs/summarize_merged_SH_min2.log 2>&1 || \
+    qiime feature-table summarize \
+      --i-table qza/merged_SH_table_min2.qza \
+      --o-feature-frequencies qza/merged_SH_min2_feature_frequencies.qza \
+      --o-sample-frequencies qza/merged_SH_min2_sample_frequencies.qza \
+      --o-summary qzv/merged_SH_table_min2.qzv \
+      > logs/summarize_merged_SH_min2.log 2>&1
+else
+    echo "[SKIP] qzv/merged_SH_table_min2.qzv exists"
+fi
+
+echo "========================================"
+echo "[DONE]"
+echo "========================================"
+
+ls -lh qza/merged_SH_table.qza
+ls -lh qza/merged_SH_table_min2.qza
+ls -lh qzv/merged_SH_table_min2.qzv
+
+rm -rf /tmp/qiime2*
+
+du -sh qza qzv logs results 2>/dev/null
+BASH
+
+chmod +x scripts/08_merge_SH_tables.sh
+#2. 检查语法并运行
+bash -n scripts/08_merge_SH_tables.sh
+bash scripts/08_merge_SH_tables.sh
+#3. 如果报错，看日志
+#如果停在合并：
+tail -n 80 logs/merge_SH_tables.log
+#如果停在过滤：
+tail -n 80 logs/filter_SH_min2.log
+#如果停在 summarize：
+tail -n 80 logs/summarize_merged_SH_min2.log
+#4. 成功后继续做 taxonomy barplot
+#如果 merged_SH_table_min2.qza 成功生成，就运行：
+qiime taxa barplot \
+  --i-table qza/merged_SH_table_min2.qza \
+  --i-taxonomy qza/UNITE_SH_taxonomy.qza \
+  --m-metadata-file metadata/metadata_valid.tsv \
+  --o-visualization qzv/merged_SH_taxa_barplot.qzv
+#然后可以用 QIIME2 View 打开：
+qzv/merged_SH_table_min2.qzv
+qzv/merged_SH_taxa_barplot.qzv
