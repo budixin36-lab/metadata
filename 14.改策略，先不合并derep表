@@ -14,3 +14,196 @@ rm -f qza/merged_derep_repseqs.qza
 rm -f qza/merged_derep_table_no_singleton.qza
 rm -f qza/merged_derep_repseqs_no_singleton.qza
 rm -rf /tmp/qiime2*
+#下载General FASTA release → Fungi → Version 10.0 → 2025-02-19Includes singletons set as RefS (in dynamic files)
+#文件已经放到/mnt/d/ITS_SH_pipeline/reference/sh_general_release_19.02.2025.tgz
+#下一步是解压 → 找到 FASTA → 从 header 里提取 SH ID 和 taxonomy → 导入 QIIME2
+#1. 解压 UNITE 文件
+cd /mnt/d/ITS_SH_pipeline/reference
+
+tar -xzvf sh_general_release_19.02.2025.tgz
+#然后查看解压出了什么：
+find . -maxdepth 2 -type f | sed 's#^\./##'
+#解压成功了。现在有两个 FASTA：
+#sh_general_release_dynamic_19.02.2025.fasta
+#sh_general_release_dynamic_19.02.2025_dev.fasta
+#应该优先用这个：
+#sh_general_release_dynamic_19.02.2025.fasta
+#不要用 _dev.fasta。dev 通常是开发/附加版本，不适合作为主分析的稳定参考。
+#1. 看一下 header 是否正常
+grep "^>" sh_general_release_dynamic_19.02.2025.fasta | head -n 5
+#看到类似：>某名称|某accession|SHxxxxxxx.10FU|reps|k__Fungi;...就可以继续。
+#2. 回到项目根目录
+cd /mnt/d/ITS_SH_pipeline
+#3. 生成 SH reference 和 taxonomy 文件
+#直接运行这个脚本：
+cat > scripts/06_prepare_unite_sh_reference.py <<'PY'
+import re
+from pathlib import Path
+
+infile = Path("reference/sh_general_release_dynamic_19.02.2025.fasta")
+out_fa = Path("reference/UNITE_SH_reps.fasta")
+out_tax = Path("reference/UNITE_SH_taxonomy.tsv")
+out_tax_noheader = Path("reference/UNITE_SH_taxonomy_noheader.tsv")
+
+if not infile.exists():
+    raise SystemExit(f"Cannot find {infile}")
+
+seen = set()
+current_keep = False
+
+with open(infile, "r", encoding="utf-8", errors="ignore") as fin, \
+     open(out_fa, "w") as fout, \
+     open(out_tax, "w") as ftax, \
+     open(out_tax_noheader, "w") as ftax_noheader:
+
+    ftax.write("Feature ID\tTaxon\n")
+
+    for line in fin:
+        line = line.rstrip("\n")
+
+        if line.startswith(">"):
+            header = line[1:]
+
+            m = re.search(r"(SH\d+\.\d+[A-Z]+)", header)
+            if not m:
+                current_keep = False
+                continue
+
+            sh = m.group(1)
+
+            km = re.search(r"(k__.+)$", header)
+            if km:
+                tax = km.group(1)
+            else:
+                tax = "k__Fungi"
+
+            if sh in seen:
+                current_keep = False
+                continue
+
+            seen.add(sh)
+            current_keep = True
+
+            fout.write(f">{sh}\n")
+            ftax.write(f"{sh}\t{tax}\n")
+            ftax_noheader.write(f"{sh}\t{tax}\n")
+
+        else:
+            if current_keep:
+                seq = line.strip()
+                if seq:
+                    fout.write(seq + "\n")
+
+print(f"Wrote: {out_fa}")
+print(f"Wrote: {out_tax}")
+print(f"Wrote: {out_tax_noheader}")
+print(f"Number of unique SH IDs: {len(seen)}")
+PY
+
+python scripts/06_prepare_unite_sh_reference.py
+#4. 检查生成结果
+head reference/UNITE_SH_reps.fasta
+head reference/UNITE_SH_taxonomy.tsv
+grep -c "^>" reference/UNITE_SH_reps.fasta
+#应该看到 SH ID 作为 fasta header，例如：>SH1206915.10FU
+#5. 导入 QIIME2
+qiime tools import \
+  --type 'FeatureData[Sequence]' \
+  --input-path reference/UNITE_SH_reps.fasta \
+  --output-path qza/UNITE_SH_reps.qza
+
+qiime tools import \
+  --type 'FeatureData[Taxonomy]' \
+  --input-format HeaderlessTSVTaxonomyFormat \
+  --input-path reference/UNITE_SH_taxonomy_noheader.tsv \
+  --output-path qza/UNITE_SH_taxonomy.qza
+#UNITE SH reference 已经准备好了：
+#UNITE_SH_reps.fasta: 102137 个 SH/参考序列
+#qza/UNITE_SH_reps.qza: 11M
+#qza/UNITE_SH_taxonomy.qza: 1.5M
+#下一步不要再合并 derep table，而是每个 derep 结果分别映射到 UNITE SH
+#1. 新建 SH mapping 脚本
+cd /mnt/d/ITS_SH_pipeline
+
+cat > scripts/07_map_each_derep_to_unite_SH.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+
+export TMPDIR="/tmp"
+export TMP="/tmp"
+export TEMP="/tmp"
+
+mkdir -p qza logs
+
+REF="qza/UNITE_SH_reps.qza"
+
+if [[ ! -s "$REF" ]]; then
+    echo "ERROR: cannot find $REF"
+    exit 1
+fi
+
+for table in qza/*derep_table.qza
+do
+    base=$(basename "$table" _derep_table.qza)
+    repseqs="qza/${base}_derep_repseqs.qza"
+
+    out_table="qza/${base}_SH_table.qza"
+    out_repseqs="qza/${base}_SH_repseqs.qza"
+    out_unmatched="qza/${base}_unmatched_repseqs.qza"
+
+    if [[ ! -s "$repseqs" ]]; then
+        echo "[SKIP] missing repseqs for $base"
+        continue
+    fi
+
+    if [[ -s "$out_table" && -s "$out_repseqs" && -s "$out_unmatched" ]]; then
+        echo "[SKIP] $base SH mapping already exists"
+        continue
+    fi
+
+    echo "========================================"
+    echo "[SH MAPPING] $base"
+    echo "========================================"
+
+    qiime vsearch cluster-features-closed-reference \
+      --i-table "$table" \
+      --i-sequences "$repseqs" \
+      --i-reference-sequences "$REF" \
+      --p-perc-identity 0.97 \
+      --p-strand both \
+      --p-threads "$THREADS" \
+      --o-clustered-table "$out_table" \
+      --o-clustered-sequences "$out_repseqs" \
+      --o-unmatched-sequences "$out_unmatched" \
+      > "logs/SH_mapping_${base}.log" 2>&1
+
+    rm -rf /tmp/qiime2*
+
+    echo "[DONE] $base"
+    ls -lh "$out_table" "$out_repseqs" "$out_unmatched"
+done
+
+echo "All per-group SH mappings finished."
+BASH
+
+chmod +x scripts/07_map_each_derep_to_unite_SH.sh
+#2. 先检查脚本语法
+bash -n scripts/07_map_each_derep_to_unite_SH.sh
+#3. 运行 SH mapping
+bash scripts/07_map_each_derep_to_unite_SH.sh
+#这一步会对每个 derep 结果分别生成：
+#*_SH_table.qza
+#*_SH_repseqs.qza
+#*_unmatched_repseqs.qza
+#4. 如果中途停了，看对应 log
+#例如停在 paired_ITS1_batch03：
+tail -n 80 logs/SH_mapping_paired_ITS1_batch03.log
+#如果只是某一个 batch 出问题，可以继续从断点跑，因为脚本会跳过已经生成的 SH mapping 结果。
+#5. 跑完后检查数量
+ls qza/*_SH_table.qza | wc -l
+ls qza/*_unmatched_repseqs.qza | wc -l
+ls -lh qza/*_SH_table.qza | head
+#如果前面有 13 个 derep 结果，这里也应该有 13 个 SH_table。
+#完成这一步后，我们再合并这些 *_SH_table.qza。这时候 feature 已经是 UNITE SH ID，数量会比 derep sequence features 少很多，合并应该不会像刚才那样爆内存。
