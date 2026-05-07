@@ -149,3 +149,11 @@ tail -n 80 logs/filter_global_singletons.log
 #qza/merged_derep_table_no_singleton.qza
 #qza/merged_derep_repseqs_no_singleton.qza
 #作为输入
+#内存不够，被系统直接杀掉了，不是 QIIME2 正常报错。
+#你看到：
+#[MERGE TABLES]
+#Terminated
+#而 logs/merge_tables.log 里没有真正的错误，只停在 warning，说明命令大概率被系统 OOM kill 了。原因是你的 derep feature 太多，之前 paired_ITS2 单组就已经有 208 万 features，把 13 个 derep table 直接合并会非常吃内存。
+#所以现在不要继续尝试：
+#qiime feature-table merge 所有 derep table
+#这条路对你电脑不现实。
