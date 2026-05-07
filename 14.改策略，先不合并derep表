@@ -1,0 +1,16 @@
+#改策略：不要先合并 derep 表，更适合你电脑的路线是：
+#每一组 derep_table + derep_repseqs->分别 closed-reference mapping 到 UNITE SH->得到每组 sample × UNITE_SH 表->再合并 SH 表
+#这样更省内存，因为映射到 UNITE SH 后 feature 数会大幅下降
+#singleton 过滤怎么办？可以改成：
+#不在 derep 阶段过滤 singleton
+#直接分别映射到 UNITE SH
+#最后在合并后的 SH 表上过滤低丰度 SH
+#也就是：
+#derep features 不过滤→ SH mapping→ 合并 SH table→ 对 SH table 做 min-frequency 2 或更高阈值过滤
+#这对你的目标更合理，因为你最终分析单位是 UNITE SH，不是 derep sequence feature。
+#先删除可能生成了一半的 merged 文件：
+rm -f qza/merged_derep_table.qza
+rm -f qza/merged_derep_repseqs.qza
+rm -f qza/merged_derep_table_no_singleton.qza
+rm -f qza/merged_derep_repseqs_no_singleton.qza
+rm -rf /tmp/qiime2*
