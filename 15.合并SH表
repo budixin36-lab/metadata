@@ -349,3 +349,61 @@ print()
 print("Mapping rate by group:")
 print(df.groupby("group")["mapping_rate"].describe())
 PY
+#现在的总体情况
+#样本数：3425
+#平均 mapping rate：0.681
+#中位数 mapping rate：0.783
+#<0.5 的样本：879
+#<0.2 的样本：412
+#明显有问题的组：
+#paired_ITS1_batch04  mean 0.060, median 0
+#paired_ITS1_batch05  mean 0.358, median 0.271
+#single_ITS1          mean 0.451, median 0.477
+#single_ITS2          mean 0.280, median 0.258
+#下一步先定位低映射率样本来自哪里
+#运行这个，按 BioProject、region、single/paired 汇总：
+python - <<'PY'
+import pandas as pd
+
+mr = pd.read_csv("results/SH_mapping_rate_by_sample.tsv", sep="\t")
+meta = pd.read_csv("metadata/metadata_valid.csv", dtype=str)
+
+df = mr.merge(meta, left_on="sampleid", right_on="sampleid", how="left")
+
+print("Mapping rate by BioProject:")
+out = df.groupby(["BioProject", "amplified_region", "single_paired"])["mapping_rate"].agg(
+    count="count", mean="mean", median="median", min="min", max="max"
+).sort_values("mean")
+
+print(out.head(30))
+out.to_csv("results/SH_mapping_rate_by_bioproject.tsv", sep="\t")
+
+low = df[df["mapping_rate"] < 0.2].copy()
+low.to_csv("results/low_mapping_samples_lt0.2.tsv", sep="\t", index=False)
+
+print()
+print("Wrote:")
+print("results/SH_mapping_rate_by_bioproject.tsv")
+print("results/low_mapping_samples_lt0.2.tsv")
+print()
+print("Low mapping samples <0.2:", len(low))
+PY
+#然后看最低的项目：
+head -n 30 results/SH_mapping_rate_by_bioproject.tsv
+#检查 batch04 是哪些样本 / BioProject
+python - <<'PY'
+import pandas as pd
+
+mr = pd.read_csv("results/SH_mapping_rate_by_sample.tsv", sep="\t")
+meta = pd.read_csv("metadata/metadata_valid.csv", dtype=str)
+
+df = mr.merge(meta, on="sampleid", how="left")
+
+b4 = df[df["group"] == "paired_ITS1_batch04"]
+print(b4[["sampleid", "BioProject", "amplified_region", "single_paired", "total_derep_reads", "matched_to_UNITE_SH", "mapping_rate"]].head(50))
+print()
+print(b4.groupby("BioProject")["mapping_rate"].agg(["count", "mean", "median", "min", "max"]).sort_values("mean"))
+
+b4.to_csv("results/paired_ITS1_batch04_mapping_details.tsv", sep="\t", index=False)
+PY
+#如果 batch04 基本集中在一个或两个 BioProject，那很可能是该项目的问题，而不是整个流程的问题。
