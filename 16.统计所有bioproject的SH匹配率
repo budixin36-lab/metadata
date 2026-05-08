@@ -1,0 +1,184 @@
+#metadata 中该 BioProject 的总样本数
+#进入 mapping rate 统计的样本数
+#mapping_rate > 0 的样本数
+#missing 的样本数
+#直接用下面这个脚本，对所有 BioProject 一次性统计清楚
+cd /mnt/d/ITS_SH_pipeline
+
+python - <<'PY'
+import pandas as pd
+
+meta = pd.read_csv("metadata/metadata_valid.csv", dtype=str)
+mr = pd.read_csv("results/SH_mapping_rate_by_sample.tsv", sep="\t")
+
+# 只保留需要的 mapping 信息
+mr2 = mr[["sampleid", "group", "total_derep_reads", "matched_to_UNITE_SH", "mapping_rate"]].copy()
+mr2["mapping_rate"] = pd.to_numeric(mr2["mapping_rate"], errors="coerce")
+mr2["matched_to_UNITE_SH"] = pd.to_numeric(mr2["matched_to_UNITE_SH"], errors="coerce")
+mr2["total_derep_reads"] = pd.to_numeric(mr2["total_derep_reads"], errors="coerce")
+
+df = meta.merge(mr2, on="sampleid", how="left")
+
+rows = []
+for bp, g in df.groupby("BioProject", dropna=False):
+    metadata_samples = len(g)
+    with_mapping_rate = g["mapping_rate"].notna().sum()
+    missing_mapping_rate = g["mapping_rate"].isna().sum()
+    nonzero_samples = (g["mapping_rate"].fillna(0) > 0).sum()
+    zero_samples = (g["mapping_rate"].fillna(-1) == 0).sum()
+    ge02_samples = (g["mapping_rate"].fillna(0) >= 0.2).sum()
+    total_matched = g["matched_to_UNITE_SH"].fillna(0).sum()
+    total_derep = g["total_derep_reads"].fillna(0).sum()
+
+    if nonzero_samples == 0:
+        qc_status = "no_valid_SH_mapped_samples"
+    elif ge02_samples == 0:
+        qc_status = "very_low_SH_mapping"
+    else:
+        qc_status = "has_SH_mapped_samples"
+
+    rows.append({
+        "BioProject": bp,
+        "metadata_samples": metadata_samples,
+        "samples_with_mapping_rate": int(with_mapping_rate),
+        "samples_missing_mapping_rate": int(missing_mapping_rate),
+        "samples_mapping_rate_eq_0": int(zero_samples),
+        "samples_mapping_rate_gt_0": int(nonzero_samples),
+        "samples_mapping_rate_ge_0.2": int(ge02_samples),
+        "mean_mapping_rate_among_available": g["mapping_rate"].mean(),
+        "median_mapping_rate_among_available": g["mapping_rate"].median(),
+        "min_mapping_rate_among_available": g["mapping_rate"].min(),
+        "max_mapping_rate_among_available": g["mapping_rate"].max(),
+        "total_derep_reads_available": int(total_derep),
+        "total_SH_mapped_reads_available": int(total_matched),
+        "overall_project_mapping_rate_available": total_matched / total_derep if total_derep > 0 else 0,
+        "qc_status": qc_status,
+    })
+
+out = pd.DataFrame(rows).sort_values(
+    ["samples_mapping_rate_gt_0", "overall_project_mapping_rate_available", "metadata_samples"],
+    ascending=[True, True, False]
+)
+
+out.to_csv("results/SH_mapping_QC_by_BioProject_full_metadata.tsv", sep="\t", index=False)
+
+print(out.head(30).to_string(index=False))
+print()
+print("Wrote results/SH_mapping_QC_by_BioProject_full_metadata.tsv")
+PY
+#然后重点看这个文件：
+#results/SH_mapping_QC_by_BioProject_full_metadata.tsv
+#在这个表里，如果某个项目满足：
+#samples_mapping_rate_gt_0 = 0
+#那就说明这个 BioProject 在最终 UNITE SH 表里没有任何有效样本，可以整项目剔除。
+python - <<'PY'
+import pandas as pd
+from pathlib import Path
+
+meta = pd.read_csv("metadata/metadata_valid.csv", dtype=str)
+mr = pd.read_csv("results/SH_mapping_rate_by_sample.tsv", sep="\t", dtype=str)
+
+problem_bps = [
+    "PRJNA695353", "PRJNA566442", "PRJNA745381",
+    "PRJNA599105", "PRJNA511363", "PRJNA380769"
+]
+
+manifest_files = list(Path("manifests").glob("*.tsv")) + list(Path("manifests/batches/paired_ITS1").glob("*.tsv"))
+
+for bp in problem_bps:
+    sub = meta[meta["BioProject"] == bp]
+    print("\n======", bp, "======")
+    print("metadata samples:", len(sub))
+    print("with mapping rate:", sub["sampleid"].isin(mr["sampleid"]).sum())
+
+    in_manifest = 0
+    not_in_manifest = []
+    for sid in sub["sampleid"]:
+        found = False
+        for f in manifest_files:
+            if sid in f.read_text(errors="ignore"):
+                found = True
+                break
+        if found:
+            in_manifest += 1
+        else:
+            not_in_manifest.append(sid)
+
+    print("in manifests:", in_manifest)
+    print("not in manifests:", len(not_in_manifest))
+    if not_in_manifest:
+        print("first missing:", ", ".join(not_in_manifest[:10]))
+PY
+#这个能区分：
+#没进 manifest vs 进了 manifest 但后续 ITSxpress/derep/SH mapping 没产生结果
+#结果说明：
+#这些 BioProject 的样本都进了 manifest，
+#但没有出现在 SH_mapping_rate_by_sample.tsv 里。
+#建议把下面这些 BioProject 从 SH-based alpha/beta 多样性分析 里整体剔除：
+#PRJNA695353
+#PRJNA566442
+#PRJNA745381
+#PRJNA599105
+#PRJNA511363
+#PRJNA380769
+#再加上之前明确的技术问题样本：
+#SRR17629862
+#理由：
+#这些 BioProject 的所有样本均进入了 manifest，但未产生有效的 UNITE SH mapping 结果；
+#其中部分样本没有形成可统计的 derep/SH 结果，或 SH mapping rate 全部为 0。
+#因此，这些 BioProject 不适合用于后续基于 UNITE SH 表的 alpha 和 beta 多样性分析。
+#接下来生成最终 metadata 和过滤 SH 表
+#不要覆盖原始 metadata_valid.csv，新建一个最终版本。
+cd /mnt/d/ITS_SH_pipeline
+
+python - <<'PY'
+import pandas as pd
+
+meta = pd.read_csv("metadata/metadata_valid.csv", dtype=str)
+
+exclude_bioprojects = {
+    "PRJNA695353",
+    "PRJNA566442",
+    "PRJNA745381",
+    "PRJNA599105",
+    "PRJNA511363",
+    "PRJNA380769",
+}
+
+exclude_samples = {
+    "SRR17629862",
+}
+
+removed = meta[
+    meta["BioProject"].isin(exclude_bioprojects) |
+    meta["sampleid"].isin(exclude_samples)
+].copy()
+
+filtered = meta[
+    ~meta["BioProject"].isin(exclude_bioprojects) &
+    ~meta["sampleid"].isin(exclude_samples)
+].copy()
+
+removed.to_csv("metadata/excluded_samples_no_valid_SH_mapping_or_pair_mismatch.csv", index=False)
+filtered.to_csv("metadata/metadata_valid_SH_final.csv", index=False)
+
+filtered_tsv = filtered.rename(columns={"sampleid": "sample-id"})
+filtered_tsv.to_csv("metadata/metadata_valid_SH_final.tsv", sep="\t", index=False)
+
+print("Original metadata samples:", len(meta))
+print("Removed samples:", len(removed))
+print("Remaining samples:", len(filtered))
+print()
+print("Removed by BioProject:")
+print(removed["BioProject"].value_counts(dropna=False))
+print()
+print("Wrote:")
+print("metadata/excluded_samples_no_valid_SH_mapping_or_pair_mismatch.csv")
+print("metadata/metadata_valid_SH_final.csv")
+print("metadata/metadata_valid_SH_final.tsv")
+PY
+#然后过滤 SH 表：
+qiime feature-table filter-samples \
+  --i-table qza/merged_SH_table_min2.qza \
+  --m-metadata-file metadata/metadata_valid_SH_final.tsv \
+  --o-filtered-table qza/merged_SH_table_min2_final.qza
