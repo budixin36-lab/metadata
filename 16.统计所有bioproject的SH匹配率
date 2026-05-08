@@ -204,12 +204,62 @@ print("Final metadata samples:", len(meta))
 print("Final samples with mapping rate:", meta["sampleid"].isin(mr["sampleid"]).sum())
 print("Final samples missing mapping rate:", (~meta["sampleid"].isin(mr["sampleid"])).sum())
 PY
-#如果还有 missing mapping rate，再继续查；如果没有，就可以进入 alpha/beta diversity。
-#现在的 metadata_valid_SH_final.csv 里还有：260 个样本没有 mapping rate
-#这些样本不应该进入后续 alpha/beta 多样性分析。它们不是因为前面那几个“全项目失败”的 BioProject，而是来自其他 BioProject 中部分样本没形成有效 derep/SH mapping 结果。
-#最简单、最稳妥的规则是：
-#最终用于 SH-based alpha/beta diversity 的 metadata，只保留：
-#1. 有 mapping rate 的样本
-#2. matched_to_UNITE_SH > 0 的样本
-#3. 不包含 SRR17629862
-#4. 不包含前面整项目无有效 SH 的 BioProject
+#更合理的原则是：
+#1. 整个 BioProject 完全没有有效 SH-mapped 样本 → 可以剔除整个项目。
+#2. 某个 BioProject 内部 mapping rate 有起伏 → 不要按样本随意删。
+#3. 个别样本如果根本不在 SH 表里 → 它不是“删不删”的问题，而是它没有可用于 SH 多样性分析的数据。
+#也就是说，mapping rate 低但大于 0 的样本可以保留；但如果一个样本完全没有出现在 SH table 里，alpha/beta 多样性分析实际上也分析不到它。
+#可以把它理解为两种情况：
+#mapping_rate = 0 或没有 mapping rate：这个样本没有有效 SH counts，进入不了 SH 表或在 SH 表中全 0。
+#mapping_rate 很低但 > 0：这个样本有 SH counts，只是匹配率低。可以保留，但后续解释时注意。
+#所以我建议你现在不要再按 mapping_rate < 0.2 继续删样本。更稳妥的做法是：
+#最终用于多样性分析的 metadata 只和实际 SH 表中的样本对齐，不再额外设置 mapping rate 阈值。
+#这样不是主观删样本，而是：
+#SH 表里有的样本 → 保留
+#SH 表里没有的样本 → 无法参与 SH-based diversity
+#先检查最终 SH 表到底有多少样本：
+cd /mnt/d/ITS_SH_pipeline
+
+python - <<'PY'
+from biom import load_table
+
+table = load_table("results/merged_SH_table_min2/feature-table.biom")
+samples = list(table.ids(axis="sample"))
+
+print("Samples in merged SH table:", len(samples))
+print(samples[:10])
+PY
+#然后生成一个只按 SH 表样本对齐的 metadata：
+python - <<'PY'
+import pandas as pd
+from biom import load_table
+
+meta = pd.read_csv("metadata/metadata_valid_SH_final.csv", dtype=str)
+
+table = load_table("results/merged_SH_table_min2/feature-table.biom")
+table_samples = set(table.ids(axis="sample"))
+
+keep = meta[meta["sampleid"].isin(table_samples)].copy()
+missing = meta[~meta["sampleid"].isin(table_samples)].copy()
+
+keep.to_csv("metadata/metadata_valid_SH_table_matched.csv", index=False)
+keep.rename(columns={"sampleid": "sample-id"}).to_csv(
+    "metadata/metadata_valid_SH_table_matched.tsv",
+    sep="\t",
+    index=False
+)
+
+missing.to_csv("metadata/samples_in_metadata_but_not_SH_table.csv", index=False)
+
+print("Metadata samples before:", len(meta))
+print("Samples kept because present in SH table:", len(keep))
+print("Samples absent from SH table:", len(missing))
+print()
+print("Wrote:")
+print("metadata/metadata_valid_SH_table_matched.csv")
+print("metadata/metadata_valid_SH_table_matched.tsv")
+print("metadata/samples_in_metadata_but_not_SH_table.csv")
+PY
+#你的方法描述可以写成：
+#在剔除没有有效 SH-mapped 样本的 BioProject 以及 R1/R2 reads 数不一致的样本后，后续多样性分析仅使用最终 UNITE SH 特征表中实际存在的样本。
+#未再根据 mapping rate 阈值进一步剔除单个样本，但保留 mapping rate 作为质量控制和结果解释指标。
