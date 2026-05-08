@@ -263,3 +263,21 @@ PY
 #你的方法描述可以写成：
 #在剔除没有有效 SH-mapped 样本的 BioProject 以及 R1/R2 reads 数不一致的样本后，后续多样性分析仅使用最终 UNITE SH 特征表中实际存在的样本。
 #未再根据 mapping rate 阈值进一步剔除单个样本，但保留 mapping rate 作为质量控制和结果解释指标。
+#结果：
+#metadata_valid_SH_final.csv：3656 个样本
+#有 mapping rate 的样本：3396 个
+#最终 merged_SH_table_min2 里实际存在的样本：3256 个
+#1. 为什么有 mapping rate 的样本是 3396，但 SH 表里只有 3256？
+#因为你最后用的是：merged_SH_table_min2
+#这个表经过了：去掉总丰度 < 2 的 SH feature
+#所以有些样本虽然曾经有少量 reads 成功映射到 UNITE SH，也就是有 mapping rate，但它们映射到的 SH 可能都是全局 singleton 或极低丰度 feature。
+#过滤 min2 之后，这些样本在最终表里就没有任何 SH feature 了，于是不会出现在最终 SH 表中。
+#2. 最合理的最终分析用 metadata 是哪个？
+#metadata_valid_SH_table_matched.tsv
+#逻辑是：只保留最终 SH 表里实际存在的样本
+#也就是说，最终分析数据应该是：
+#qza/merged_SH_table_min2.qza
+#metadata/metadata_valid_SH_table_matched.tsv
+#或者对应导出的：
+#results/merged_SH_table_min2/merged_SH_table_min2.tsv
+#metadata/metadata_valid_SH_table_matched.tsv
