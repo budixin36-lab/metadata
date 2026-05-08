@@ -182,3 +182,34 @@ qiime feature-table filter-samples \
   --i-table qza/merged_SH_table_min2.qza \
   --m-metadata-file metadata/metadata_valid_SH_final.tsv \
   --o-filtered-table qza/merged_SH_table_min2_final.qza
+#导出最终 SH 表：
+mkdir -p results/merged_SH_table_min2_final
+
+qiime tools export \
+  --input-path qza/merged_SH_table_min2_final.qza \
+  --output-path results/merged_SH_table_min2_final
+
+biom convert \
+  -i results/merged_SH_table_min2_final/feature-table.biom \
+  -o results/merged_SH_table_min2_final/merged_SH_table_min2_final.tsv \
+  --to-tsv
+#最后再检查最终样本数
+python - <<'PY'
+import pandas as pd
+
+meta = pd.read_csv("metadata/metadata_valid_SH_final.csv", dtype=str)
+mr = pd.read_csv("results/SH_mapping_rate_by_sample.tsv", sep="\t")
+
+print("Final metadata samples:", len(meta))
+print("Final samples with mapping rate:", meta["sampleid"].isin(mr["sampleid"]).sum())
+print("Final samples missing mapping rate:", (~meta["sampleid"].isin(mr["sampleid"])).sum())
+PY
+#如果还有 missing mapping rate，再继续查；如果没有，就可以进入 alpha/beta diversity。
+#现在的 metadata_valid_SH_final.csv 里还有：260 个样本没有 mapping rate
+#这些样本不应该进入后续 alpha/beta 多样性分析。它们不是因为前面那几个“全项目失败”的 BioProject，而是来自其他 BioProject 中部分样本没形成有效 derep/SH mapping 结果。
+#最简单、最稳妥的规则是：
+#最终用于 SH-based alpha/beta diversity 的 metadata，只保留：
+#1. 有 mapping rate 的样本
+#2. matched_to_UNITE_SH > 0 的样本
+#3. 不包含 SRR17629862
+#4. 不包含前面整项目无有效 SH 的 BioProject
