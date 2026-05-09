@@ -726,3 +726,134 @@ cat(paste0("  ", upload_order, collapse = "\n"), "\n")
 RSCRIPT
 #运行：
 Rscript scripts/10_make_itol_host_tree_files_v2.R
+#让 Country 图例显示全部真实国家，可以 只重生成 country 这一份文件
+cd /mnt/d/ITS_SH_pipeline
+
+cat > scripts/10_make_itol_country_only_allcountries_v4.R <<'RSCRIPT'
+packages <- c("dplyr", "tidyr", "stringr", "RColorBrewer")
+for (p in packages) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    install.packages(p, repos = "https://cloud.r-project.org")
+  }
+}
+
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(RColorBrewer)
+
+input <- "metadata/metadata_valid_SH_table_matched.tsv"
+sumfile <- "results/itol_host_tree_v4/host_species_summary_for_iTOL_v4.tsv"
+outfile <- "results/itol_host_tree_v4/itol_country_piechart_allcountries_v4.txt"
+
+meta <- read.delim(input, sep = "\t", check.names = FALSE, stringsAsFactors = FALSE)
+
+if ("sample-id" %in% names(meta) && !"sampleid" %in% names(meta)) {
+  names(meta)[names(meta) == "sample-id"] <- "sampleid"
+}
+
+clean_text <- function(x) {
+  x <- trimws(as.character(x))
+  x[is.na(x) | x == "" |
+      tolower(x) %in% c(
+        "na","n/a","missing",
+        "not recorded","not_recorded",
+        "not reported","not_reported",
+        "unknown"
+      )] <- "Unknown"
+  x
+}
+
+meta2 <- meta %>%
+  mutate(
+    sampleid = clean_text(sampleid),
+    host_species = clean_text(host_species),
+    country = clean_text(country)
+  ) %>%
+  filter(
+    sampleid != "Unknown",
+    host_species != "Unknown",
+    country != "Unknown"
+  ) %>%
+  distinct(sampleid, host_species, country)
+
+species_summary <- read.delim(sumfile, sep = "\t", check.names = FALSE, stringsAsFactors = FALSE)
+
+# 所有真实国家，不再合并成 Other
+country_levels_raw <- meta2 %>%
+  count(country, sort = TRUE) %>%
+  pull(country)
+
+# iTOL 里字段名尽量别带空格
+country_levels <- str_replace_all(country_levels_raw, " ", ".")
+
+country_map <- data.frame(
+  country = country_levels_raw,
+  country_clean = country_levels,
+  stringsAsFactors = FALSE
+)
+
+# 自动配色
+n_country <- length(country_levels)
+base_cols <- brewer.pal(min(max(3, min(12, n_country)), 12), "Paired")
+country_cols <- setNames(
+  colorRampPalette(base_cols)(n_country),
+  country_levels
+)
+
+country_counts <- meta2 %>%
+  left_join(country_map, by = "country") %>%
+  group_by(host_species, country_clean) %>%
+  summarise(n = n_distinct(sampleid), .groups = "drop") %>%
+  complete(host_species, country_clean = country_levels, fill = list(n = 0)) %>%
+  pivot_wider(names_from = country_clean, values_from = n, values_fill = 0) %>%
+  left_join(species_summary %>% select(host_species, tip_id), by = "host_species")
+
+for (cc in country_levels) {
+  if (!cc %in% names(country_counts)) {
+    country_counts[[cc]] <- 0
+  }
+}
+
+cat("DATASET_PIECHART\n", file = outfile)
+cat("SEPARATOR TAB\n", file = outfile, append = TRUE)
+cat("DATASET_LABEL\tCountry\n", file = outfile, append = TRUE)
+cat("COLOR\t#000000\n", file = outfile, append = TRUE)
+cat("SHOW_LABELS\t1\n", file = outfile, append = TRUE)
+cat("LABEL_SIZE_FACTOR\t1\n", file = outfile, append = TRUE)
+cat(paste0("FIELD_COLORS\t", paste(country_cols[country_levels], collapse = "\t"), "\n"),
+    file = outfile, append = TRUE)
+cat(paste0("FIELD_LABELS\t", paste(country_levels, collapse = "\t"), "\n"),
+    file = outfile, append = TRUE)
+cat("MARGIN\t10\n", file = outfile, append = TRUE)
+cat("HEIGHT_FACTOR\t0.9\n", file = outfile, append = TRUE)
+cat("BORDER_WIDTH\t1\n", file = outfile, append = TRUE)
+cat("BORDER_COLOR\t#FFFFFF\n", file = outfile, append = TRUE)
+cat("LEGEND_TITLE\tCountry\n", file = outfile, append = TRUE)
+cat(paste0("LEGEND_SHAPES\t", paste(rep(1, length(country_levels)), collapse = "\t"), "\n"),
+    file = outfile, append = TRUE)
+cat(paste0("LEGEND_COLORS\t", paste(country_cols[country_levels], collapse = "\t"), "\n"),
+    file = outfile, append = TRUE)
+cat(paste0("LEGEND_LABELS\t", paste(country_levels, collapse = "\t"), "\n"),
+    file = outfile, append = TRUE)
+cat("DATA\n", file = outfile, append = TRUE)
+
+country_out <- country_counts %>%
+  select(tip_id, all_of(country_levels)) %>%
+  mutate(position = -1, radius = 10) %>%
+  select(tip_id, position, radius, all_of(country_levels))
+
+write.table(
+  country_out,
+  outfile,
+  sep = "\t", quote = FALSE,
+  row.names = FALSE, col.names = FALSE,
+  append = TRUE
+)
+
+cat("Wrote:", outfile, "\n")
+cat("Countries used:\n")
+cat(paste(country_levels_raw, collapse = ", "), "\n")
+RSCRIPT
+
+Rscript scripts/10_make_itol_country_only_allcountries_v4.R
