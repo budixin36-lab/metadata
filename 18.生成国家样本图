@@ -1,0 +1,261 @@
+#基于/mnt/d/ITS_SH_pipeline/metadata/metadata_valid_SH_table_matched.tsv
+#用其中的 country 列统计每个国家的样本数量，并生成类似你发的图 2 的世界地图气泡图。
+#直接在 WSL 终端运行下面整段即可。
+cat > /mnt/d/ITS_SH_pipeline/scripts/plot_country_sample_map.R <<'EOF'
+# ============================================================
+# Plot country sample map from final metadata table
+# Input : metadata_valid_SH_table_matched.tsv
+# Output: country_sample_map.png / pdf
+# ============================================================
+
+input_file <- "/mnt/d/ITS_SH_pipeline/metadata/metadata_valid_SH_table_matched.tsv"
+out_dir <- "/mnt/d/ITS_SH_pipeline/results/country_sample_map"
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# ---------- install/load packages ----------
+pkgs <- c(
+  "readr", "dplyr", "stringr", "ggplot2",
+  "sf", "rnaturalearth", "rnaturalearthdata",
+  "countrycode", "ggrepel", "scales"
+)
+
+to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(to_install) > 0) {
+  install.packages(to_install, repos = "https://cloud.r-project.org")
+}
+
+library(readr)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(countrycode)
+library(ggrepel)
+library(scales)
+
+# ---------- read final metadata ----------
+metadata <- read_tsv(
+  input_file,
+  show_col_types = FALSE,
+  locale = locale(encoding = "UTF-8")
+)
+
+# ---------- check country column ----------
+if (!"country" %in% names(metadata)) {
+  stop(
+    "没有找到 country 列。当前表格列名为：\n",
+    paste(names(metadata), collapse = ", ")
+  )
+}
+
+# ---------- define empty values ----------
+empty_values <- c(
+  "", "NA", "N/A", "na", "n/a",
+  "missing", "Missing", "MISSING",
+  "not recorded", "not_recorded", "Not recorded", "NOT RECORDED",
+  "not reported", "not_reported", "Not reported", "NOT REPORTED",
+  "not applicable", "not_applicable", "Not applicable", "NOT APPLICABLE",
+  "unknown", "Unknown", "UNKNOWN",
+  "null", "NULL", "None", "none", "-"
+)
+
+# ---------- count samples by country ----------
+country_counts <- metadata %>%
+  mutate(
+    country_raw = as.character(country),
+    country_raw = str_trim(country_raw),
+    country_raw = ifelse(country_raw %in% empty_values | is.na(country_raw), NA, country_raw),
+
+    # 处理 NCBI 常见格式，比如 China: Inner Mongolia -> China
+    country_clean = str_split_fixed(country_raw, ":", 2)[, 1],
+    country_clean = str_trim(country_clean),
+
+    # 常见名称统一
+    country_clean = case_when(
+      country_clean %in% c("USA", "U.S.A.", "US", "U.S.", "United States of America") ~ "United States",
+      country_clean %in% c("UK", "U.K.", "Great Britain", "Britain", "England") ~ "United Kingdom",
+      country_clean %in% c("Korea", "Republic of Korea", "South Korea") ~ "South Korea",
+      country_clean %in% c("PR China", "P. R. China", "People's Republic of China") ~ "China",
+      country_clean %in% c("Czech Republic") ~ "Czechia",
+      country_clean %in% c("Viet Nam") ~ "Vietnam",
+      TRUE ~ country_clean
+    )
+  ) %>%
+  filter(!is.na(country_clean), country_clean != "") %>%
+  count(country_clean, name = "samples") %>%
+  arrange(desc(samples))
+
+write_csv(
+  country_counts,
+  file.path(out_dir, "country_sample_counts.csv")
+)
+
+# ---------- world map ----------
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+# 用国家多边形的内部点作为标签/气泡位置
+world_points <- world %>%
+  mutate(
+    iso3 = iso_a3,
+    point = st_point_on_surface(geometry)
+  ) %>%
+  st_as_sf() %>%
+  mutate(
+    lon = st_coordinates(point)[, 1],
+    lat = st_coordinates(point)[, 2]
+  ) %>%
+  st_drop_geometry() %>%
+  select(name, admin, iso3, lon, lat)
+
+country_counts_map <- country_counts %>%
+  mutate(
+    iso3 = countrycode(
+      country_clean,
+      origin = "country.name",
+      destination = "iso3c"
+    )
+  )
+
+plot_data <- country_counts_map %>%
+  left_join(world_points, by = "iso3") %>%
+  mutate(
+    label = paste0(country_clean, ": ", samples)
+  )
+
+# 保存没有匹配到地图坐标的国家，方便检查
+unmatched <- plot_data %>%
+  filter(is.na(lon) | is.na(lat)) %>%
+  select(country_clean, samples, iso3)
+
+if (nrow(unmatched) > 0) {
+  write_csv(
+    unmatched,
+    file.path(out_dir, "country_unmatched_for_map.csv")
+  )
+
+  warning(
+    "有国家没有匹配到地图坐标，请检查：",
+    file.path(out_dir, "country_unmatched_for_map.csv")
+  )
+}
+
+plot_data <- plot_data %>%
+  filter(!is.na(lon), !is.na(lat))
+
+# ---------- plot ----------
+p <- ggplot() +
+  geom_sf(
+    data = world,
+    fill = "grey85",
+    color = "white",
+    linewidth = 0.2
+  ) +
+  geom_point(
+    data = plot_data,
+    aes(x = lon, y = lat, size = samples),
+    shape = 21,
+    fill = "#EFD85A",
+    color = "grey30",
+    alpha = 0.75,
+    stroke = 0.35
+  ) +
+  geom_label_repel(
+    data = plot_data,
+    aes(x = lon, y = lat, label = label),
+    family = "Times New Roman",
+    size = 3.2,
+    label.size = 0.25,
+    label.padding = unit(0.15, "lines"),
+    box.padding = 0.45,
+    point.padding = 0.25,
+    segment.color = "grey30",
+    segment.linewidth = 0.3,
+    min.segment.length = 0,
+    max.overlaps = Inf,
+    seed = 123
+  ) +
+  scale_size_area(
+    max_size = 18,
+    breaks = pretty_breaks(n = 4)
+  ) +
+  coord_sf(
+    xlim = c(-180, 180),
+    ylim = c(-58, 85),
+    expand = FALSE
+  ) +
+  labs(
+    title = "Geographical distribution of samples",
+    size = "Number of samples"
+  ) +
+  theme_classic(base_family = "Times New Roman") +
+  theme(
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    axis.line = element_blank(),
+    legend.position = "right",
+    legend.title = element_text(size = 11),
+    legend.text = element_text(size = 10),
+    panel.border = element_rect(color = "grey30", fill = NA, linewidth = 0.8),
+    plot.margin = margin(8, 8, 8, 8)
+  )
+
+# ---------- save ----------
+ggsave(
+  filename = file.path(out_dir, "country_sample_map.png"),
+  plot = p,
+  width = 13,
+  height = 7,
+  dpi = 600
+)
+
+ggsave(
+  filename = file.path(out_dir, "country_sample_map.pdf"),
+  plot = p,
+  width = 13,
+  height = 7
+)
+
+message("Done!")
+message("Country counts saved to: ", file.path(out_dir, "country_sample_counts.csv"))
+message("Map PNG saved to: ", file.path(out_dir, "country_sample_map.png"))
+message("Map PDF saved to: ", file.path(out_dir, "country_sample_map.pdf"))
+
+EOF
+
+Rscript /mnt/d/ITS_SH_pipeline/scripts/plot_country_sample_map.R
+#invalid font type意思是：R 在 WSL/Linux 环境里找不到或不能正确调用 Times New Roman 字体，所以保存图片时失败了。
+#st_point_on_surface may not give correct results for longitude/latitude data
+#只是提醒经纬度坐标下取国家内部点可能不完美，不影响主要结果。
+#Ignoring unknown parameters: segment.linewidth
+#说明你当前 ggrepel 版本不认识 segment.linewidth，把它改成旧参数 segment.size 就行。
+#直接在 WSL 终端运行下面两行，把字体和参数替换掉：
+sed -i 's/family = "Times New Roman"/family = "serif"/g' /mnt/d/ITS_SH_pipeline/scripts/plot_country_sample_map.R
+sed -i 's/base_family = "Times New Roman"/base_family = "serif"/g' /mnt/d/ITS_SH_pipeline/scripts/plot_country_sample_map.R
+sed -i 's/segment.linewidth = 0.3/segment.size = 0.3/g' /mnt/d/ITS_SH_pipeline/scripts/plot_country_sample_map.R
+#然后重新运行：
+Rscript /mnt/d/ITS_SH_pipeline/scripts/plot_country_sample_map.R
+#你说的两个版式要求，最好直接在 R 里改好，比在 PPT 里手动拖更稳：
+#删除上方标题
+#把图例放到地图里面的空白处，比如太平洋右下角或非洲东南侧空白处
+#你可以直接用下面 3 条 sed 修改现有脚本：
+sed -i 's/title = "Geographical distribution of samples",/title = NULL,/g' /mnt/d/ITS_SH_pipeline/scripts/plot_country_sample_map.R
+sed -i 's/legend.position = "right"/legend.position = c(0.18, 0.30)/g' /mnt/d/ITS_SH_pipeline/scripts/plot_country_sample_map.R
+sed -i '/plot.title = element_text/d' /mnt/d/ITS_SH_pipeline/scripts/plot_country_sample_map.R
+#然后重新运行：
+Rscript /mnt/d/ITS_SH_pipeline/scripts/plot_country_sample_map.R
+#另外，图例位置可以调。现在这句：
+#legend.position = c(0.88, 0.35)
+#意思是放在图内偏右、偏下的位置。你可以改成：
+#legend.position = c(0.86, 0.28)
+#会更靠右下；改成：
+#legend.position = c(0.18, 0.30)
+#会放到左下太平洋/南美附近空白处。
+#在 WSL 终端运行这一句，把图例位置改得更靠左下：
+sed -i 's/legend.position = c([^)]*)/legend.position = c(0.12, 0.24)/g' /mnt/d/ITS_SH_pipeline/scripts/plot_country_sample_map.R
+#然后重新运行脚本：
+Rscript /mnt/d/ITS_SH_pipeline/scripts/plot_country_sample_map.R
