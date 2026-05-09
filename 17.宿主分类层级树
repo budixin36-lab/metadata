@@ -1,0 +1,728 @@
+#你在 WSL 里运行下面脚本后，会生成这些文件：
+#results/itol_host_tree/host_taxonomic_tree.nwk
+#results/itol_host_tree/itol_labels.txt
+#results/itol_host_tree/itol_host_family_colorstrip.txt
+#results/itol_host_tree/itol_samples_simplebar.txt
+#results/itol_host_tree/itol_status_colorstrip.txt
+#results/itol_host_tree/itol_country_colorstrip.txt
+#results/itol_host_tree/host_species_summary_for_iTOL.tsv
+#然后把这些上传到 iTOL，就能在网页里手动调图。
+#1. 生成 iTOL 文件
+#在 WSL 里运行：
+cd /mnt/d/ITS_SH_pipeline
+
+cat > scripts/10_make_itol_host_tree_files.R <<'RSCRIPT'
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(RColorBrewer)
+
+input <- "metadata/metadata_valid_SH_table_matched.tsv"
+outdir <- "results/itol_host_tree"
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+meta <- read.delim(input, sep = "\t", check.names = FALSE, stringsAsFactors = FALSE)
+
+if ("sample-id" %in% names(meta) && !"sampleid" %in% names(meta)) {
+  names(meta)[names(meta) == "sample-id"] <- "sampleid"
+}
+
+needed <- c("sampleid", "host_order", "host_family", "host_genus",
+            "host_species", "status", "country")
+
+missing_cols <- setdiff(needed, names(meta))
+if (length(missing_cols) > 0) {
+  stop("Missing columns: ", paste(missing_cols, collapse = ", "))
+}
+
+empty_values <- c(
+  "", "NA", "N/A", "na", "n/a",
+  "missing", "Missing", "MISSING",
+  "not recorded", "not_recorded",
+  "not reported", "not_reported",
+  "unknown", "Unknown", "UNKNOWN"
+)
+
+clean_text <- function(x) {
+  x <- trimws(as.character(x))
+  x[x %in% empty_values | is.na(x)] <- "Unknown"
+  x
+}
+
+safe_id <- function(x) {
+  x <- gsub(" x ", "_x_", x)
+  x <- gsub("[^A-Za-z0-9]+", "_", x)
+  x <- gsub("^_+|_+$", "", x)
+  x
+}
+
+meta2 <- meta %>%
+  mutate(
+    host_order = clean_text(host_order),
+    host_family = clean_text(host_family),
+    host_genus = clean_text(host_genus),
+    host_species = clean_text(host_species),
+    status = clean_text(status),
+    country = clean_text(country)
+  ) %>%
+  filter(
+    host_order != "Unknown",
+    host_family != "Unknown",
+    host_genus != "Unknown",
+    host_species != "Unknown"
+  ) %>%
+  mutate(
+    status = case_when(
+      str_detect(str_to_lower(status), "domestic|domesticated|demestic|demesticated") ~ "Domesticated",
+      str_detect(str_to_lower(status), "captive") ~ "Captive",
+      str_detect(str_to_lower(status), "wild") ~ "Wild",
+      TRUE ~ "Other"
+    ),
+    country = ifelse(country == "Unknown", "Other", country)
+  )
+
+species_summary <- meta2 %>%
+  group_by(host_order, host_family, host_genus, host_species) %>%
+  summarise(samples = n(), .groups = "drop") %>%
+  arrange(host_order, host_family, host_genus, host_species) %>%
+  mutate(
+    tip_id = safe_id(host_species)
+  )
+
+# 防止不同物种清洗后 ID 重复
+if (any(duplicated(species_summary$tip_id))) {
+  species_summary <- species_summary %>%
+    group_by(tip_id) %>%
+    mutate(tip_id = ifelse(n() > 1, paste0(tip_id, "_", row_number()), tip_id)) %>%
+    ungroup()
+}
+
+# 每个物种主状态、主国家
+status_main <- meta2 %>%
+  group_by(host_species, status) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(host_species) %>%
+  slice_max(n, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(host_species, main_status = status)
+
+country_main <- meta2 %>%
+  group_by(host_species, country) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(host_species) %>%
+  slice_max(n, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(host_species, main_country = country)
+
+species_summary <- species_summary %>%
+  left_join(status_main, by = "host_species") %>%
+  left_join(country_main, by = "host_species")
+
+write.table(
+  species_summary,
+  file.path(outdir, "host_species_summary_for_iTOL.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+# ---------- 生成 Newick 树 ----------
+make_species_newick <- function(df) {
+  paste0(df$tip_id, ":1", collapse = ",")
+}
+
+make_genus_newick <- function(df) {
+  genus_parts <- df %>%
+    group_by(host_genus) %>%
+    group_split()
+
+  paste(
+    sapply(genus_parts, function(gdf) {
+      genus <- unique(gdf$host_genus)
+      paste0("(", make_species_newick(gdf), ")", safe_id(genus), ":1")
+    }),
+    collapse = ","
+  )
+}
+
+make_family_newick <- function(df) {
+  family_parts <- df %>%
+    group_by(host_family) %>%
+    group_split()
+
+  paste(
+    sapply(family_parts, function(fdf) {
+      fam <- unique(fdf$host_family)
+      n <- sum(fdf$samples)
+      paste0("(", make_genus_newick(fdf), ")", safe_id(paste0(fam, "_n", n)), ":1")
+    }),
+    collapse = ","
+  )
+}
+
+make_order_newick <- function(df) {
+  order_parts <- df %>%
+    group_by(host_order) %>%
+    group_split()
+
+  paste(
+    sapply(order_parts, function(odf) {
+      ord <- unique(odf$host_order)
+      n <- sum(odf$samples)
+      paste0("(", make_family_newick(odf), ")", safe_id(paste0(ord, "_n", n)), ":1")
+    }),
+    collapse = ","
+  )
+}
+
+newick <- paste0("(", make_order_newick(species_summary), ")Root;")
+writeLines(newick, file.path(outdir, "host_taxonomic_tree.nwk"))
+
+# ---------- iTOL labels：让 tip 显示原始物种名 ----------
+labels_file <- file.path(outdir, "itol_labels.txt")
+cat("LABELS\n", file = labels_file)
+cat("SEPARATOR TAB\n", file = labels_file, append = TRUE)
+cat("DATA\n", file = labels_file, append = TRUE)
+write.table(
+  species_summary %>% select(tip_id, host_species),
+  labels_file,
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = FALSE,
+  append = TRUE
+)
+
+# ---------- 颜色 ----------
+family_levels <- sort(unique(species_summary$host_family))
+family_cols <- setNames(
+  colorRampPalette(brewer.pal(8, "Pastel2"))(length(family_levels)),
+  family_levels
+)
+
+status_cols <- c(
+  "Domesticated" = "#00BFC4",
+  "Captive" = "#F8766D",
+  "Wild" = "#FDB863",
+  "Other" = "#BDBDBD"
+)
+
+country_levels <- sort(unique(species_summary$main_country))
+country_cols <- setNames(
+  colorRampPalette(brewer.pal(12, "Paired"))(length(country_levels)),
+  country_levels
+)
+
+# ---------- 写 iTOL colorstrip ----------
+write_colorstrip <- function(filename, dataset_label, legend_title, id_col, group_col, colors) {
+  f <- file.path(outdir, filename)
+  cat("DATASET_COLORSTRIP\n", file = f)
+  cat("SEPARATOR TAB\n", file = f, append = TRUE)
+  cat(paste0("DATASET_LABEL\t", dataset_label, "\n"), file = f, append = TRUE)
+  cat("COLOR\t#000000\n", file = f, append = TRUE)
+  cat(paste0("LEGEND_TITLE\t", legend_title, "\n"), file = f, append = TRUE)
+  cat(paste0("LEGEND_SHAPES\t", paste(rep(1, length(colors)), collapse = "\t"), "\n"), file = f, append = TRUE)
+  cat(paste0("LEGEND_COLORS\t", paste(unname(colors), collapse = "\t"), "\n"), file = f, append = TRUE)
+  cat(paste0("LEGEND_LABELS\t", paste(names(colors), collapse = "\t"), "\n"), file = f, append = TRUE)
+  cat("DATA\n", file = f, append = TRUE)
+
+  dat <- data.frame(
+    id = id_col,
+    color = unname(colors[group_col]),
+    label = group_col,
+    stringsAsFactors = FALSE
+  )
+
+  write.table(
+    dat,
+    f,
+    sep = "\t",
+    quote = FALSE,
+    row.names = FALSE,
+    col.names = FALSE,
+    append = TRUE
+  )
+}
+
+write_colorstrip(
+  filename = "itol_host_family_colorstrip.txt",
+  dataset_label = "Host family",
+  legend_title = "Host family",
+  id_col = species_summary$tip_id,
+  group_col = species_summary$host_family,
+  colors = family_cols
+)
+
+write_colorstrip(
+  filename = "itol_status_colorstrip.txt",
+  dataset_label = "Status",
+  legend_title = "Status",
+  id_col = species_summary$tip_id,
+  group_col = species_summary$main_status,
+  colors = status_cols
+)
+
+write_colorstrip(
+  filename = "itol_country_colorstrip.txt",
+  dataset_label = "Country",
+  legend_title = "Country",
+  id_col = species_summary$tip_id,
+  group_col = species_summary$main_country,
+  colors = country_cols
+)
+
+# ---------- iTOL simple bar：samples ----------
+bar_file <- file.path(outdir, "itol_samples_simplebar.txt")
+cat("DATASET_SIMPLEBAR\n", file = bar_file)
+cat("SEPARATOR TAB\n", file = bar_file, append = TRUE)
+cat("DATASET_LABEL\tSamples\n", file = bar_file, append = TRUE)
+cat("COLOR\t#4D4D4D\n", file = bar_file, append = TRUE)
+cat("WIDTH\t120\n", file = bar_file, append = TRUE)
+cat("SHOW_VALUES\t1\n", file = bar_file, append = TRUE)
+cat("DATA\n", file = bar_file, append = TRUE)
+
+write.table(
+  species_summary %>% select(tip_id, samples),
+  bar_file,
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = FALSE,
+  append = TRUE
+)
+
+cat("Wrote iTOL files to:", outdir, "\n")
+cat("Species:", nrow(species_summary), "\n")
+cat("Tree:", file.path(outdir, "host_taxonomic_tree.nwk"), "\n")
+RSCRIPT
+#运行：
+Rscript scripts/10_make_itol_host_tree_files.R
+#下一步我们重新生成 iTOL v2 文件，解决你刚才提的几个问题：
+#1. Samples 只显示数字，不再画灰色柱状条
+#2. Status 做饼图，显示 Domesticated / Captive / Wild 比例
+#3. Country 做饼图，显示多个国家组成
+#4. Host family 用 clade/range 背景色，而不是右侧色条
+#5. host_order 和 host_family 节点显示样本数
+#1. 生成新版 iTOL 文件
+#在 WSL 里运行：
+cd /mnt/d/ITS_SH_pipeline
+
+cat > scripts/10_make_itol_host_tree_files_v2.R <<'RSCRIPT'
+packages <- c("dplyr", "tidyr", "stringr", "RColorBrewer")
+
+for (p in packages) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    install.packages(p, repos = "https://cloud.r-project.org")
+  }
+}
+
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(RColorBrewer)
+
+input <- "metadata/metadata_valid_SH_table_matched.tsv"
+outdir <- "results/itol_host_tree_v2"
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+meta <- read.delim(input, sep = "\t", check.names = FALSE, stringsAsFactors = FALSE)
+
+if ("sample-id" %in% names(meta) && !"sampleid" %in% names(meta)) {
+  names(meta)[names(meta) == "sample-id"] <- "sampleid"
+}
+
+needed <- c(
+  "sampleid", "host_order", "host_family", "host_genus",
+  "host_species", "status", "country"
+)
+
+missing_cols <- setdiff(needed, names(meta))
+if (length(missing_cols) > 0) {
+  stop("Missing columns: ", paste(missing_cols, collapse = ", "))
+}
+
+empty_values <- c(
+  "", "NA", "N/A", "na", "n/a",
+  "missing", "Missing", "MISSING",
+  "not recorded", "not_recorded",
+  "not reported", "not_reported",
+  "unknown", "Unknown", "UNKNOWN"
+)
+
+clean_text <- function(x) {
+  x <- trimws(as.character(x))
+  x[x %in% empty_values | is.na(x)] <- "Unknown"
+  x
+}
+
+safe_id <- function(x) {
+  x <- gsub(" x ", "_x_", x)
+  x <- gsub("[^A-Za-z0-9]+", "_", x)
+  x <- gsub("^_+|_+$", "", x)
+  x
+}
+
+hex_alpha <- function(hex, alpha = "55") {
+  paste0(hex, alpha)
+}
+
+meta2 <- meta %>%
+  mutate(
+    host_order = clean_text(host_order),
+    host_family = clean_text(host_family),
+    host_genus = clean_text(host_genus),
+    host_species = clean_text(host_species),
+    status = clean_text(status),
+    country = clean_text(country)
+  ) %>%
+  filter(
+    host_order != "Unknown",
+    host_family != "Unknown",
+    host_genus != "Unknown",
+    host_species != "Unknown"
+  ) %>%
+  mutate(
+    status = case_when(
+      str_detect(str_to_lower(status), "domestic|domesticated|demestic|demesticated") ~ "Domesticated",
+      str_detect(str_to_lower(status), "captive") ~ "Captive",
+      str_detect(str_to_lower(status), "wild") ~ "Wild",
+      TRUE ~ "Other"
+    ),
+    country = ifelse(country == "Unknown", "Other", country),
+    country = str_replace_all(country, " ", ".")
+  )
+
+# 如果真有 Other，保留下来检查，但不放入 status pie
+if (any(meta2$status == "Other")) {
+  warning("Some samples have status = Other. They will not be used in the 3-status pie chart.")
+}
+
+species_summary <- meta2 %>%
+  group_by(host_order, host_family, host_genus, host_species) %>%
+  summarise(samples = n(), .groups = "drop") %>%
+  arrange(host_order, host_family, host_genus, host_species) %>%
+  mutate(tip_id = safe_id(host_species))
+
+# 防止清洗后 ID 重复
+if (any(duplicated(species_summary$tip_id))) {
+  species_summary <- species_summary %>%
+    group_by(tip_id) %>%
+    mutate(tip_id = ifelse(n() > 1, paste0(tip_id, "_", row_number()), tip_id)) %>%
+    ungroup()
+}
+
+family_summary <- species_summary %>%
+  group_by(host_order, host_family) %>%
+  summarise(samples = sum(samples), .groups = "drop") %>%
+  mutate(
+    family_node_id = safe_id(paste0("FAMILY_", host_order, "_", host_family, "_n", samples))
+  )
+
+order_summary <- species_summary %>%
+  group_by(host_order) %>%
+  summarise(samples = sum(samples), .groups = "drop") %>%
+  mutate(
+    order_node_id = safe_id(paste0("ORDER_", host_order, "_n", samples))
+  )
+
+species_summary <- species_summary %>%
+  left_join(family_summary, by = c("host_order", "host_family")) %>%
+  left_join(order_summary, by = "host_order") %>%
+  mutate(
+    genus_node_id = safe_id(paste0("GENUS_", host_order, "_", host_family, "_", host_genus))
+  )
+
+write.table(
+  species_summary,
+  file.path(outdir, "host_species_summary_for_iTOL_v2.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+# ---------- Newick tree ----------
+make_species_newick <- function(df) {
+  paste0(df$tip_id, ":1", collapse = ",")
+}
+
+make_genus_newick <- function(df) {
+  genus_parts <- df %>%
+    group_by(host_genus, genus_node_id) %>%
+    group_split()
+
+  paste(
+    sapply(genus_parts, function(gdf) {
+      gid <- unique(gdf$genus_node_id)
+      paste0("(", make_species_newick(gdf), ")", gid, ":1")
+    }),
+    collapse = ","
+  )
+}
+
+make_family_newick <- function(df) {
+  family_parts <- df %>%
+    group_by(host_family, family_node_id) %>%
+    group_split()
+
+  paste(
+    sapply(family_parts, function(fdf) {
+      fid <- unique(fdf$family_node_id)
+      paste0("(", make_genus_newick(fdf), ")", fid, ":1")
+    }),
+    collapse = ","
+  )
+}
+
+make_order_newick <- function(df) {
+  order_parts <- df %>%
+    group_by(host_order, order_node_id) %>%
+    group_split()
+
+  paste(
+    sapply(order_parts, function(odf) {
+      oid <- unique(odf$order_node_id)
+      paste0("(", make_family_newick(odf), ")", oid, ":1")
+    }),
+    collapse = ","
+  )
+}
+
+newick <- paste0("(", make_order_newick(species_summary), ")Root;")
+writeLines(newick, file.path(outdir, "host_taxonomic_tree_v2.nwk"))
+
+# ---------- Labels：tip 显示真实物种名 ----------
+labels_file <- file.path(outdir, "itol_labels_v2.txt")
+cat("LABELS\n", file = labels_file)
+cat("SEPARATOR TAB\n", file = labels_file, append = TRUE)
+cat("DATA\n", file = labels_file, append = TRUE)
+
+write.table(
+  species_summary %>% select(tip_id, host_species),
+  labels_file,
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = FALSE,
+  append = TRUE
+)
+
+# ---------- Colors ----------
+family_levels <- sort(unique(species_summary$host_family))
+family_cols <- setNames(
+  colorRampPalette(brewer.pal(8, "Pastel2"))(length(family_levels)),
+  family_levels
+)
+
+status_levels <- c("Domesticated", "Captive", "Wild")
+status_cols <- c(
+  "Domesticated" = "#00BFC4",
+  "Captive" = "#F8766D",
+  "Wild" = "#FDB863"
+)
+
+top_countries <- meta2 %>%
+  count(country, sort = TRUE) %>%
+  filter(country != "Unknown") %>%
+  slice_head(n = 12) %>%
+  pull(country)
+
+country_levels <- c(top_countries, "Other")
+country_cols <- setNames(
+  colorRampPalette(brewer.pal(12, "Paired"))(length(country_levels)),
+  country_levels
+)
+
+# ---------- Host family clade background colors ----------
+tree_colors_file <- file.path(outdir, "itol_host_family_ranges_v2.txt")
+cat("TREE_COLORS\n", file = tree_colors_file)
+cat("SEPARATOR TAB\n", file = tree_colors_file, append = TRUE)
+cat("DATA\n", file = tree_colors_file, append = TRUE)
+
+family_range <- family_summary %>%
+  mutate(
+    color = hex_alpha(family_cols[host_family], "66"),
+    label = host_family
+  ) %>%
+  select(family_node_id, color, label)
+
+for (i in seq_len(nrow(family_range))) {
+  cat(
+    family_range$family_node_id[i], "range", family_range$color[i], family_range$label[i],
+    sep = "\t",
+    file = tree_colors_file,
+    append = TRUE
+  )
+  cat("\n", file = tree_colors_file, append = TRUE)
+}
+
+# ---------- Internal node sample-count labels ----------
+internal_text_file <- file.path(outdir, "itol_internal_sample_count_labels_v2.txt")
+cat("DATASET_TEXT\n", file = internal_text_file)
+cat("SEPARATOR TAB\n", file = internal_text_file, append = TRUE)
+cat("DATASET_LABEL\tInternal sample counts\n", file = internal_text_file, append = TRUE)
+cat("COLOR\t#000000\n", file = internal_text_file, append = TRUE)
+cat("SHOW_INTERNAL\t1\n", file = internal_text_file, append = TRUE)
+cat("LABELS_BELOW\t0\n", file = internal_text_file, append = TRUE)
+cat("SIZE_FACTOR\t0.9\n", file = internal_text_file, append = TRUE)
+cat("DATA\n", file = internal_text_file, append = TRUE)
+
+internal_counts <- bind_rows(
+  order_summary %>% transmute(id = order_node_id, label = as.character(samples)),
+  family_summary %>% transmute(id = family_node_id, label = as.character(samples))
+)
+
+write.table(
+  internal_counts %>%
+    mutate(position = 0.5, color = "#000000", style = "normal", size_factor = 1, rotation = 0) %>%
+    select(id, label, position, color, style, size_factor, rotation),
+  internal_text_file,
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = FALSE,
+  append = TRUE
+)
+
+# ---------- Samples：只显示数字 ----------
+samples_text_file <- file.path(outdir, "itol_samples_text_v2.txt")
+cat("DATASET_TEXT\n", file = samples_text_file)
+cat("SEPARATOR TAB\n", file = samples_text_file, append = TRUE)
+cat("DATASET_LABEL\tSamples\n", file = samples_text_file, append = TRUE)
+cat("COLOR\t#000000\n", file = samples_text_file, append = TRUE)
+cat("MARGIN\t10\n", file = samples_text_file, append = TRUE)
+cat("SHOW_LABELS\t1\n", file = samples_text_file, append = TRUE)
+cat("LABEL_SIZE_FACTOR\t1\n", file = samples_text_file, append = TRUE)
+cat("SIZE_FACTOR\t0.9\n", file = samples_text_file, append = TRUE)
+cat("DATA\n", file = samples_text_file, append = TRUE)
+
+write.table(
+  species_summary %>%
+    transmute(
+      id = tip_id,
+      label = as.character(samples),
+      position = -1,
+      color = "#000000",
+      style = "normal",
+      size_factor = 1,
+      rotation = 0
+    ),
+  samples_text_file,
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = FALSE,
+  append = TRUE
+)
+
+# ---------- Status pie chart ----------
+status_counts <- meta2 %>%
+  filter(status %in% status_levels) %>%
+  count(host_species, status, name = "n") %>%
+  complete(host_species, status = status_levels, fill = list(n = 0)) %>%
+  pivot_wider(names_from = status, values_from = n, values_fill = 0) %>%
+  left_join(species_summary %>% select(host_species, tip_id), by = "host_species")
+
+status_pie_file <- file.path(outdir, "itol_status_piechart_v2.txt")
+cat("DATASET_PIECHART\n", file = status_pie_file)
+cat("SEPARATOR TAB\n", file = status_pie_file, append = TRUE)
+cat("DATASET_LABEL\tStatus\n", file = status_pie_file, append = TRUE)
+cat("COLOR\t#000000\n", file = status_pie_file, append = TRUE)
+cat(paste0("FIELD_COLORS\t", paste(status_cols[status_levels], collapse = "\t"), "\n"), file = status_pie_file, append = TRUE)
+cat(paste0("FIELD_LABELS\t", paste(status_levels, collapse = "\t"), "\n"), file = status_pie_file, append = TRUE)
+cat("MARGIN\t10\n", file = status_pie_file, append = TRUE)
+cat("HEIGHT_FACTOR\t0.9\n", file = status_pie_file, append = TRUE)
+cat("BORDER_WIDTH\t1\n", file = status_pie_file, append = TRUE)
+cat("BORDER_COLOR\t#FFFFFF\n", file = status_pie_file, append = TRUE)
+cat("LEGEND_TITLE\tStatus\n", file = status_pie_file, append = TRUE)
+cat("LEGEND_SHAPES\t1\t1\t1\n", file = status_pie_file, append = TRUE)
+cat(paste0("LEGEND_COLORS\t", paste(status_cols[status_levels], collapse = "\t"), "\n"), file = status_pie_file, append = TRUE)
+cat(paste0("LEGEND_LABELS\t", paste(status_levels, collapse = "\t"), "\n"), file = status_pie_file, append = TRUE)
+cat("DATA\n", file = status_pie_file, append = TRUE)
+
+write.table(
+  status_counts %>%
+    transmute(
+      id = tip_id,
+      position = -1,
+      radius = 10,
+      Domesticated = .data[["Domesticated"]],
+      Captive = .data[["Captive"]],
+      Wild = .data[["Wild"]]
+    ),
+  status_pie_file,
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = FALSE,
+  append = TRUE
+)
+
+# ---------- Country pie chart ----------
+meta_country <- meta2 %>%
+  mutate(country_group = ifelse(country %in% top_countries, country, "Other"))
+
+country_counts <- meta_country %>%
+  count(host_species, country_group, name = "n") %>%
+  complete(host_species, country_group = country_levels, fill = list(n = 0)) %>%
+  pivot_wider(names_from = country_group, values_from = n, values_fill = 0) %>%
+  left_join(species_summary %>% select(host_species, tip_id), by = "host_species")
+
+# 保证所有 country columns 都存在
+for (cc in country_levels) {
+  if (!cc %in% names(country_counts)) {
+    country_counts[[cc]] <- 0
+  }
+}
+
+country_pie_file <- file.path(outdir, "itol_country_piechart_v2.txt")
+cat("DATASET_PIECHART\n", file = country_pie_file)
+cat("SEPARATOR TAB\n", file = country_pie_file, append = TRUE)
+cat("DATASET_LABEL\tCountry\n", file = country_pie_file, append = TRUE)
+cat("COLOR\t#000000\n", file = country_pie_file, append = TRUE)
+cat(paste0("FIELD_COLORS\t", paste(country_cols[country_levels], collapse = "\t"), "\n"), file = country_pie_file, append = TRUE)
+cat(paste0("FIELD_LABELS\t", paste(country_levels, collapse = "\t"), "\n"), file = country_pie_file, append = TRUE)
+cat("MARGIN\t10\n", file = country_pie_file, append = TRUE)
+cat("HEIGHT_FACTOR\t0.9\n", file = country_pie_file, append = TRUE)
+cat("BORDER_WIDTH\t1\n", file = country_pie_file, append = TRUE)
+cat("BORDER_COLOR\t#FFFFFF\n", file = country_pie_file, append = TRUE)
+cat("LEGEND_TITLE\tCountry\n", file = country_pie_file, append = TRUE)
+cat(paste0("LEGEND_SHAPES\t", paste(rep(1, length(country_levels)), collapse = "\t"), "\n"), file = country_pie_file, append = TRUE)
+cat(paste0("LEGEND_COLORS\t", paste(country_cols[country_levels], collapse = "\t"), "\n"), file = country_pie_file, append = TRUE)
+cat(paste0("LEGEND_LABELS\t", paste(country_levels, collapse = "\t"), "\n"), file = country_pie_file, append = TRUE)
+cat("DATA\n", file = country_pie_file, append = TRUE)
+
+country_out <- country_counts %>%
+  select(tip_id, all_of(country_levels)) %>%
+  mutate(position = -1, radius = 10) %>%
+  select(tip_id, position, radius, all_of(country_levels))
+
+write.table(
+  country_out,
+  country_pie_file,
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = FALSE,
+  append = TRUE
+)
+
+# ---------- Upload order ----------
+upload_order <- c(
+  "host_taxonomic_tree_v2.nwk",
+  "itol_labels_v2.txt",
+  "itol_host_family_ranges_v2.txt",
+  "itol_internal_sample_count_labels_v2.txt",
+  "itol_samples_text_v2.txt",
+  "itol_status_piechart_v2.txt",
+  "itol_country_piechart_v2.txt"
+)
+
+writeLines(upload_order, file.path(outdir, "UPLOAD_ORDER.txt"))
+
+cat("Wrote iTOL v2 files to:", outdir, "\n")
+cat("Species:", nrow(species_summary), "\n")
+cat("Upload order:\n")
+cat(paste0("  ", upload_order, collapse = "\n"), "\n")
+RSCRIPT
+#运行：
+Rscript scripts/10_make_itol_host_tree_files_v2.R
