@@ -1,0 +1,885 @@
+#新流程可以从这里开始：
+#*_derep_repseqs.qza
+#*_derep_table.qza
+#↓
+#导出所有 derep representative sequences
+#↓
+#合并成一个 all_derep_repseqs.fasta
+#↓
+#去掉 <40 bp 的序列
+#↓
+#去掉含 N 或其他 ambiguous bases 的序列
+#↓
+#BLASTn 到 UNITE SH representative sequences
+#↓
+#筛选：
+# similarity ≥ 98.5%
+# query coverage ≥ 90%
+# e-value ≤ 1e-50
+#↓
+#每条 derep feature 选 best-hit SH
+#↓
+#根据 derep_table.qza 把 feature abundance 汇总成 SH abundance
+#↓
+#得到新的 GlobalFungi-style SH table
+#二、不要先全量跑，先拿一个小文件试跑
+#建议先用最小或较小的文件测试，比如：
+qza/single_ITS2_derep_repseqs.qza
+qza/single_ITS2_derep_table.qza
+#先确认流程能跑通，再批量处理所有文件。你前面担心 WSL 终端强制退出，这个判断是对的，不能一上来全量 BLAST。
+#先激活你的 QIIME2 环境：
+conda activate qiime2-amplicon-2026.1
+#三、第一步：新建工作目录
+#在 WSL 里运行：
+cd /mnt/d/ITS_SH_pipeline
+
+mkdir -p globalfungi_style_test
+mkdir -p globalfungi_style_test/fasta
+mkdir -p globalfungi_style_test/ref
+mkdir -p globalfungi_style_test/blast
+mkdir -p globalfungi_style_test/tables
+mkdir -p globalfungi_style_test/results
+mkdir -p globalfungi_style_test/scripts
+#四、第二步：从一个 derep_repseqs.qza 导出 fasta
+#先以 single_ITS2 为例：
+cd /mnt/d/ITS_SH_pipeline
+
+unzip -p qza/single_ITS2_derep_repseqs.qza '*/data/dna-sequences.fasta' \
+  > globalfungi_style_test/fasta/single_ITS2_derep_repseqs.fasta
+#检查有没有成功：
+head globalfungi_style_test/fasta/single_ITS2_derep_repseqs.fasta
+grep -c "^>" globalfungi_style_test/fasta/single_ITS2_derep_repseqs.fasta
+#如果能看到 fasta header 和序列，说明导出成功。
+#五、第三步：按 GlobalFungi 思路过滤长度和歧义碱基
+#GlobalFungi 图 2 里先做了：
+#CHECK LENGTHS
+#length threshold: 40
+#REMOVE AMBIGUOUS SEQUENCES
+#你可以先用 ≥40 bp，不要一开始就用 100、150 或 200，因为那会比 GlobalFungi 更严格。
+#新建过滤脚本：
+nano globalfungi_style_test/scripts/filter_fasta_min40_noambig.awk
+#粘贴：
+BEGIN {
+  header = ""
+  seq = ""
+}
+
+function process_record() {
+  if (header == "") return
+
+  s = toupper(seq)
+
+  if (length(s) >= 40 && s ~ /^[ACGT]+$/) {
+    print header
+    print s
+  }
+}
+
+/^>/ {
+  process_record()
+  header = $0
+  seq = ""
+  next
+}
+
+{
+  seq = seq $0
+}
+
+END {
+  process_record()
+}
+#保存后运行：
+awk -f globalfungi_style_test/scripts/filter_fasta_min40_noambig.awk \
+  globalfungi_style_test/fasta/single_ITS2_derep_repseqs.fasta \
+  > globalfungi_style_test/fasta/single_ITS2_min40_noambig.fasta
+#检查过滤前后数量：
+echo "before:"
+grep -c "^>" globalfungi_style_test/fasta/single_ITS2_derep_repseqs.fasta
+
+echo "after:"
+grep -c "^>" globalfungi_style_test/fasta/single_ITS2_min40_noambig.fasta
+#因为你之前已经从 UNITE 原始 release 里提取过 UNITE_SH_reps.fasta，这个更适合作为 SH representative sequences 的 BLAST 数据库。
+#你现在接着运行：
+cd /mnt/d/ITS_SH_pipeline
+
+cp reference/UNITE_SH_reps.fasta \
+   globalfungi_style_test/ref/UNITE_SH_reps.fasta
+#检查一下：
+grep -c "^>" globalfungi_style_test/ref/UNITE_SH_reps.fasta
+head globalfungi_style_test/ref/UNITE_SH_reps.fasta
+#然后建 BLAST 数据库：
+makeblastdb \
+  -in globalfungi_style_test/ref/UNITE_SH_reps.fasta \
+  -dbtype nucl \
+  -out globalfungi_style_test/ref/UNITE_SH
+#你刚才过滤结果很好：
+#before: 522605
+#after: 522547
+#只去掉了 58 条，说明 single_ITS2 里 <40 bp 或含歧义碱基的代表序列很少。
+#八、第六步：BLASTn 试跑
+#先用 single_ITS2_min40_noambig.fasta 试跑：
+blastn \
+  -query globalfungi_style_test/fasta/single_ITS2_min40_noambig.fasta \
+  -db globalfungi_style_test/ref/UNITE_SH \
+  -out globalfungi_style_test/blast/single_ITS2_vs_UNITE_SH.outfmt6 \
+  -evalue 1e-5 \
+  -outfmt "6 qseqid sseqid pident length qlen slen qstart qend sstart send evalue bitscore qcovs" \
+  -num_threads 4 \
+  -max_target_seqs 10
+#这里先用 -evalue 1e-5 是为了先让 BLAST 输出候选 hits。后面我们再按 GlobalFungi-style 的 stricter filter 过滤：
+#e-value ≤ 1e-50
+#pident ≥ 98.5
+#qcovs ≥ 90
+#检查输出：
+head globalfungi_style_test/blast/single_ITS2_vs_UNITE_SH.outfmt6
+wc -l globalfungi_style_test/blast/single_ITS2_vs_UNITE_SH.outfmt6
+#九、第七步：筛选 best hit
+#新建脚本：
+nano globalfungi_style_test/scripts/filter_best_blast_globalfungi_style.py
+#粘贴：
+#!/usr/bin/env python3
+
+import csv
+import sys
+
+infile = sys.argv[1]
+outfile = sys.argv[2]
+
+MIN_PIDENT = 98.5
+MIN_QCOV = 90.0
+MAX_EVALUE = 1e-50
+
+best = {}
+
+with open(infile, "r", newline="") as f:
+    reader = csv.reader(f, delimiter="\t")
+
+    for row in reader:
+        if len(row) < 13:
+            continue
+
+        qseqid = row[0]
+        sseqid = row[1]
+        pident = float(row[2])
+        aln_len = int(row[3])
+        qlen = int(row[4])
+        slen = int(row[5])
+        qstart = int(row[6])
+        qend = int(row[7])
+        sstart = int(row[8])
+        send = int(row[9])
+        evalue = float(row[10])
+        bitscore = float(row[11])
+        qcovs = float(row[12])
+
+        if pident < MIN_PIDENT:
+            continue
+        if qcovs < MIN_QCOV:
+            continue
+        if evalue > MAX_EVALUE:
+            continue
+
+        record = {
+            "qseqid": qseqid,
+            "sseqid": sseqid,
+            "pident": pident,
+            "aln_len": aln_len,
+            "qlen": qlen,
+            "slen": slen,
+            "qstart": qstart,
+            "qend": qend,
+            "sstart": sstart,
+            "send": send,
+            "evalue": evalue,
+            "bitscore": bitscore,
+            "qcovs": qcovs,
+        }
+
+        if qseqid not in best:
+            best[qseqid] = record
+        else:
+            old = best[qseqid]
+            if (
+                bitscore > old["bitscore"]
+                or (bitscore == old["bitscore"] and evalue < old["evalue"])
+                or (bitscore == old["bitscore"] and evalue == old["evalue"] and pident > old["pident"])
+            ):
+                best[qseqid] = record
+
+with open(outfile, "w", newline="") as out:
+    writer = csv.writer(out, delimiter="\t")
+    writer.writerow([
+        "feature_id",
+        "sh_id",
+        "pident",
+        "qcovs",
+        "evalue",
+        "bitscore",
+        "alignment_length",
+        "query_length",
+        "subject_length"
+    ])
+
+    for qseqid in sorted(best):
+        r = best[qseqid]
+        writer.writerow([
+            r["qseqid"],
+            r["sseqid"],
+            r["pident"],
+            r["qcovs"],
+            r["evalue"],
+            r["bitscore"],
+            r["aln_len"],
+            r["qlen"],
+            r["slen"],
+        ])
+
+print(f"Kept best hits: {len(best)}")
+#运行：
+python globalfungi_style_test/scripts/filter_best_blast_globalfungi_style.py \
+  globalfungi_style_test/blast/single_ITS2_vs_UNITE_SH.outfmt6 \
+  globalfungi_style_test/results/single_ITS2_best_hits_globalfungi_style.tsv
+#查看：
+head globalfungi_style_test/results/single_ITS2_best_hits_globalfungi_style.tsv
+wc -l globalfungi_style_test/results/single_ITS2_best_hits_globalfungi_style.tsv
+#十、第八步：导出对应的 derep_table.qza
+qiime tools export \
+  --input-path qza/single_ITS2_derep_table.qza \
+  --output-path globalfungi_style_test/tables/single_ITS2_derep_table_exported
+#转成 TSV：
+biom convert \
+  -i globalfungi_style_test/tables/single_ITS2_derep_table_exported/feature-table.biom \
+  -o globalfungi_style_test/tables/single_ITS2_derep_table.tsv \
+  --to-tsv
+#检查：
+head globalfungi_style_test/tables/single_ITS2_derep_table.tsv
+#十一、第九步：把 feature 丰度汇总成 SH 丰度
+#新建脚本：
+nano globalfungi_style_test/scripts/collapse_feature_table_to_SH.py
+#粘贴：
+#!/usr/bin/env python3
+
+import csv
+import sys
+from collections import defaultdict
+
+blast_best_file = sys.argv[1]
+feature_table_file = sys.argv[2]
+out_file = sys.argv[3]
+stats_file = sys.argv[4]
+
+feature_to_sh = {}
+
+with open(blast_best_file, "r", newline="") as f:
+    reader = csv.DictReader(f, delimiter="\t")
+    for row in reader:
+        feature_to_sh[row["feature_id"]] = row["sh_id"]
+
+sample_ids = []
+sh_counts = defaultdict(lambda: defaultdict(float))
+
+total_features_in_table = 0
+mapped_features_in_table = 0
+unmapped_features_in_table = 0
+
+with open(feature_table_file, "r", newline="") as f:
+    for line in f:
+        if line.startswith("# Constructed from biom file"):
+            continue
+
+        if line.startswith("#OTU ID"):
+            header = line.rstrip("\n").split("\t")
+            sample_ids = header[1:]
+            continue
+
+        if line.startswith("#"):
+            continue
+
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) < 2:
+            continue
+
+        feature_id = parts[0]
+        counts = parts[1:]
+
+        total_features_in_table += 1
+
+        if feature_id not in feature_to_sh:
+            unmapped_features_in_table += 1
+            continue
+
+        mapped_features_in_table += 1
+        sh_id = feature_to_sh[feature_id]
+
+        for sample, count in zip(sample_ids, counts):
+            try:
+                value = float(count)
+            except ValueError:
+                value = 0.0
+
+            if value != 0:
+                sh_counts[sh_id][sample] += value
+
+with open(out_file, "w", newline="") as out:
+    writer = csv.writer(out, delimiter="\t")
+    writer.writerow(["SH_ID"] + sample_ids)
+
+    for sh_id in sorted(sh_counts):
+        row = [sh_id]
+        for sample in sample_ids:
+            value = sh_counts[sh_id].get(sample, 0.0)
+            if value.is_integer():
+                value = int(value)
+            row.append(value)
+        writer.writerow(row)
+
+with open(stats_file, "w") as s:
+    s.write(f"total_features_in_table\t{total_features_in_table}\n")
+    s.write(f"mapped_features_in_table\t{mapped_features_in_table}\n")
+    s.write(f"unmapped_features_in_table\t{unmapped_features_in_table}\n")
+    if total_features_in_table > 0:
+        s.write(f"mapped_feature_percent\t{mapped_features_in_table / total_features_in_table * 100:.4f}\n")
+
+print(f"Output SH table: {out_file}")
+print(f"Stats: {stats_file}")
+#运行：
+python globalfungi_style_test/scripts/collapse_feature_table_to_SH.py \
+  globalfungi_style_test/results/single_ITS2_best_hits_globalfungi_style.tsv \
+  globalfungi_style_test/tables/single_ITS2_derep_table.tsv \
+  globalfungi_style_test/results/single_ITS2_SH_table_globalfungi_style.tsv \
+  globalfungi_style_test/results/single_ITS2_SH_mapping_stats.txt
+#查看结果：
+head globalfungi_style_test/results/single_ITS2_SH_table_globalfungi_style.tsv
+cat globalfungi_style_test/results/single_ITS2_SH_mapping_stats.txt
+#十二、你跑完这个试验后重点看什么？
+#主要看这几个文件：
+#globalfungi_style_test/results/single_ITS2_best_hits_globalfungi_style.tsv
+#globalfungi_style_test/results/single_ITS2_SH_table_globalfungi_style.tsv
+#globalfungi_style_test/results/single_ITS2_SH_mapping_stats.txt
+#尤其是：
+#mapped_feature_percent
+#如果这个比例极低，比如只有 5%、10%，说明 98.5% + 90% coverage 对你的数据太严格，后面可能要讨论是否使用 98.5、97、95 等不同阈值做敏感性分析。
+#如果比例还可以，比如 30%、50% 或更高，那就说明 GlobalFungi-style 流程在你的数据上可行。
+#你这个 mapped_feature_percent = 7.1861% 偏低。先不要马上全量跑完后才发现问题，
+#建议再用一个 paired_ITS1 或 paired_ITS2 小批次试一下，看是不是所有数据都这么低。
+#试跑 paired_ITS2 
+#1. 新建完整试跑脚本
+cd /mnt/d/ITS_SH_pipeline
+
+nano globalfungi_style_test/run_paired_ITS2_test.sh
+#把下面全部粘贴进去：
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd /mnt/d/ITS_SH_pipeline
+
+# ========== 基本设置 ==========
+base="paired_ITS2"
+
+repseq_qza="qza/${base}_derep_repseqs.qza"
+table_qza="qza/${base}_derep_table.qza"
+
+workdir="globalfungi_style_test"
+fasta_dir="${workdir}/fasta"
+ref_dir="${workdir}/ref"
+blast_dir="${workdir}/blast"
+table_dir="${workdir}/tables"
+result_dir="${workdir}/results"
+script_dir="${workdir}/scripts"
+log_dir="${workdir}/logs"
+
+mkdir -p "$fasta_dir" "$ref_dir" "$blast_dir" "$table_dir" "$result_dir" "$script_dir" "$log_dir"
+
+raw_fasta="${fasta_dir}/${base}_derep_repseqs.fasta"
+filtered_fasta="${fasta_dir}/${base}_min40_noambig.fasta"
+blast_out="${blast_dir}/${base}_vs_UNITE_SH.outfmt6"
+
+best_hits="${result_dir}/${base}_best_hits_globalfungi_style.tsv"
+table_export_dir="${table_dir}/${base}_derep_table_exported"
+table_tsv="${table_dir}/${base}_derep_table.tsv"
+sh_table="${result_dir}/${base}_SH_table_globalfungi_style.tsv"
+stats_file="${result_dir}/${base}_SH_mapping_stats.txt"
+run_log="${log_dir}/${base}_run.log"
+
+ref_fasta="${ref_dir}/UNITE_SH_reps.fasta"
+blast_db="${ref_dir}/UNITE_SH"
+
+echo "===== Start paired_ITS2 GlobalFungi-style test =====" | tee "$run_log"
+date | tee -a "$run_log"
+
+# ========== 检查输入 ==========
+echo "Checking input files..." | tee -a "$run_log"
+
+if [ ! -s "$repseq_qza" ]; then
+  echo "ERROR: Missing $repseq_qza" | tee -a "$run_log"
+  exit 1
+fi
+
+if [ ! -s "$table_qza" ]; then
+  echo "ERROR: Missing $table_qza" | tee -a "$run_log"
+  exit 1
+fi
+
+if [ ! -s "reference/UNITE_SH_reps.fasta" ]; then
+  echo "ERROR: Missing reference/UNITE_SH_reps.fasta" | tee -a "$run_log"
+  exit 1
+fi
+
+# ========== 准备参考序列 ==========
+echo "Preparing UNITE SH reference..." | tee -a "$run_log"
+
+if [ ! -s "$ref_fasta" ]; then
+  cp reference/UNITE_SH_reps.fasta "$ref_fasta"
+fi
+
+echo "Reference sequences:" | tee -a "$run_log"
+grep -c "^>" "$ref_fasta" | tee -a "$run_log"
+
+# ========== 建 BLAST 数据库 ==========
+echo "Checking BLAST database..." | tee -a "$run_log"
+
+if [ ! -s "${blast_db}.nin" ] && [ ! -s "${blast_db}.ndb" ]; then
+  echo "Building BLAST database..." | tee -a "$run_log"
+  makeblastdb \
+    -in "$ref_fasta" \
+    -dbtype nucl \
+    -out "$blast_db" \
+    2>&1 | tee -a "$run_log"
+else
+  echo "BLAST database already exists." | tee -a "$run_log"
+fi
+
+# ========== 导出 repseqs fasta ==========
+echo "Exporting repseqs fasta from $repseq_qza ..." | tee -a "$run_log"
+
+unzip -p "$repseq_qza" '*/data/dna-sequences.fasta' > "$raw_fasta"
+
+echo "Raw representative sequences:" | tee -a "$run_log"
+grep -c "^>" "$raw_fasta" | tee -a "$run_log"
+
+# ========== 写过滤脚本 ==========
+cat > "${script_dir}/filter_fasta_min40_noambig.awk" <<'EOF'
+BEGIN {
+  header = ""
+  seq = ""
+}
+
+function process_record() {
+  if (header == "") return
+
+  s = toupper(seq)
+
+  if (length(s) >= 40 && s ~ /^[ACGT]+$/) {
+    print header
+    print s
+  }
+}
+
+/^>/ {
+  process_record()
+  header = $0
+  seq = ""
+  next
+}
+
+{
+  seq = seq $0
+}
+
+END {
+  process_record()
+}
+EOF
+
+# ========== 过滤长度和歧义碱基 ==========
+echo "Filtering sequences: keep length >=40 bp and A/C/G/T only..." | tee -a "$run_log"
+
+awk -f "${script_dir}/filter_fasta_min40_noambig.awk" \
+  "$raw_fasta" \
+  > "$filtered_fasta"
+
+echo "Filtered representative sequences:" | tee -a "$run_log"
+grep -c "^>" "$filtered_fasta" | tee -a "$run_log"
+
+# ========== BLASTn ==========
+echo "Running BLASTn..." | tee -a "$run_log"
+
+blastn \
+  -query "$filtered_fasta" \
+  -db "$blast_db" \
+  -out "$blast_out" \
+  -evalue 1e-5 \
+  -outfmt "6 qseqid sseqid pident length qlen slen qstart qend sstart send evalue bitscore qcovs" \
+  -num_threads 4 \
+  -max_target_seqs 10 \
+  2>&1 | tee -a "$run_log"
+
+echo "BLAST output lines:" | tee -a "$run_log"
+wc -l "$blast_out" | tee -a "$run_log"
+
+# ========== 写 best-hit 筛选脚本 ==========
+cat > "${script_dir}/filter_best_blast_globalfungi_style.py" <<'EOF'
+#!/usr/bin/env python3
+
+import csv
+import sys
+
+infile = sys.argv[1]
+outfile = sys.argv[2]
+
+MIN_PIDENT = 98.5
+MIN_QCOV = 90.0
+MAX_EVALUE = 1e-50
+
+best = {}
+
+with open(infile, "r", newline="") as f:
+    reader = csv.reader(f, delimiter="\t")
+
+    for row in reader:
+        if len(row) < 13:
+            continue
+
+        qseqid = row[0]
+        sseqid = row[1]
+        pident = float(row[2])
+        aln_len = int(row[3])
+        qlen = int(row[4])
+        slen = int(row[5])
+        qstart = int(row[6])
+        qend = int(row[7])
+        sstart = int(row[8])
+        send = int(row[9])
+        evalue = float(row[10])
+        bitscore = float(row[11])
+        qcovs = float(row[12])
+
+        if pident < MIN_PIDENT:
+            continue
+        if qcovs < MIN_QCOV:
+            continue
+        if evalue > MAX_EVALUE:
+            continue
+
+        record = {
+            "qseqid": qseqid,
+            "sseqid": sseqid,
+            "pident": pident,
+            "aln_len": aln_len,
+            "qlen": qlen,
+            "slen": slen,
+            "qstart": qstart,
+            "qend": qend,
+            "sstart": sstart,
+            "send": send,
+            "evalue": evalue,
+            "bitscore": bitscore,
+            "qcovs": qcovs,
+        }
+
+        if qseqid not in best:
+            best[qseqid] = record
+        else:
+            old = best[qseqid]
+            if (
+                bitscore > old["bitscore"]
+                or (bitscore == old["bitscore"] and evalue < old["evalue"])
+                or (bitscore == old["bitscore"] and evalue == old["evalue"] and pident > old["pident"])
+            ):
+                best[qseqid] = record
+
+with open(outfile, "w", newline="") as out:
+    writer = csv.writer(out, delimiter="\t")
+    writer.writerow([
+        "feature_id",
+        "sh_id",
+        "pident",
+        "qcovs",
+        "evalue",
+        "bitscore",
+        "alignment_length",
+        "query_length",
+        "subject_length"
+    ])
+
+    for qseqid in sorted(best):
+        r = best[qseqid]
+        writer.writerow([
+            r["qseqid"],
+            r["sseqid"],
+            r["pident"],
+            r["qcovs"],
+            r["evalue"],
+            r["bitscore"],
+            r["aln_len"],
+            r["qlen"],
+            r["slen"],
+        ])
+
+print(f"Kept best hits: {len(best)}")
+EOF
+
+# ========== 筛选 best hit ==========
+echo "Filtering best hits: pident >=98.5, qcovs >=90, evalue <=1e-50..." | tee -a "$run_log"
+
+python "${script_dir}/filter_best_blast_globalfungi_style.py" \
+  "$blast_out" \
+  "$best_hits" \
+  2>&1 | tee -a "$run_log"
+
+echo "Best-hit file lines including header:" | tee -a "$run_log"
+wc -l "$best_hits" | tee -a "$run_log"
+
+# ========== 导出 derep table ==========
+echo "Exporting derep table..." | tee -a "$run_log"
+
+rm -rf "$table_export_dir"
+
+qiime tools export \
+  --input-path "$table_qza" \
+  --output-path "$table_export_dir" \
+  2>&1 | tee -a "$run_log"
+
+biom convert \
+  -i "${table_export_dir}/feature-table.biom" \
+  -o "$table_tsv" \
+  --to-tsv \
+  2>&1 | tee -a "$run_log"
+
+# ========== 写 feature table 汇总到 SH 的脚本 ==========
+cat > "${script_dir}/collapse_feature_table_to_SH.py" <<'EOF'
+#!/usr/bin/env python3
+
+import csv
+import sys
+from collections import defaultdict
+
+blast_best_file = sys.argv[1]
+feature_table_file = sys.argv[2]
+out_file = sys.argv[3]
+stats_file = sys.argv[4]
+
+feature_to_sh = {}
+
+with open(blast_best_file, "r", newline="") as f:
+    reader = csv.DictReader(f, delimiter="\t")
+    for row in reader:
+        feature_to_sh[row["feature_id"]] = row["sh_id"]
+
+sample_ids = []
+sh_counts = defaultdict(lambda: defaultdict(float))
+
+total_features_in_table = 0
+mapped_features_in_table = 0
+unmapped_features_in_table = 0
+
+with open(feature_table_file, "r", newline="") as f:
+    for line in f:
+        if line.startswith("# Constructed from biom file"):
+            continue
+
+        if line.startswith("#OTU ID"):
+            header = line.rstrip("\n").split("\t")
+            sample_ids = header[1:]
+            continue
+
+        if line.startswith("#"):
+            continue
+
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) < 2:
+            continue
+
+        feature_id = parts[0]
+        counts = parts[1:]
+
+        total_features_in_table += 1
+
+        if feature_id not in feature_to_sh:
+            unmapped_features_in_table += 1
+            continue
+
+        mapped_features_in_table += 1
+        sh_id = feature_to_sh[feature_id]
+
+        for sample, count in zip(sample_ids, counts):
+            try:
+                value = float(count)
+            except ValueError:
+                value = 0.0
+
+            if value != 0:
+                sh_counts[sh_id][sample] += value
+
+with open(out_file, "w", newline="") as out:
+    writer = csv.writer(out, delimiter="\t")
+    writer.writerow(["SH_ID"] + sample_ids)
+
+    for sh_id in sorted(sh_counts):
+        row = [sh_id]
+        for sample in sample_ids:
+            value = sh_counts[sh_id].get(sample, 0.0)
+            if value.is_integer():
+                value = int(value)
+            row.append(value)
+        writer.writerow(row)
+
+with open(stats_file, "w") as s:
+    s.write(f"total_features_in_table\t{total_features_in_table}\n")
+    s.write(f"mapped_features_in_table\t{mapped_features_in_table}\n")
+    s.write(f"unmapped_features_in_table\t{unmapped_features_in_table}\n")
+    if total_features_in_table > 0:
+        s.write(f"mapped_feature_percent\t{mapped_features_in_table / total_features_in_table * 100:.4f}\n")
+
+print(f"Output SH table: {out_file}")
+print(f"Stats: {stats_file}")
+EOF
+
+# ========== 汇总 feature table 到 SH table ==========
+echo "Collapsing feature table to SH table..." | tee -a "$run_log"
+
+python "${script_dir}/collapse_feature_table_to_SH.py" \
+  "$best_hits" \
+  "$table_tsv" \
+  "$sh_table" \
+  "$stats_file" \
+  2>&1 | tee -a "$run_log"
+
+echo "Mapping stats:" | tee -a "$run_log"
+cat "$stats_file" | tee -a "$run_log"
+
+echo "SH table dimensions:" | tee -a "$run_log"
+echo "Rows including header:" | tee -a "$run_log"
+wc -l "$sh_table" | tee -a "$run_log"
+
+# ========== 安全清理中间文件 ==========
+if [ -s "$sh_table" ] && [ -s "$stats_file" ] && [ -s "$best_hits" ]; then
+  echo "Final outputs exist. Cleaning temporary files for $base ..." | tee -a "$run_log"
+
+  rm -f "$raw_fasta"
+  rm -f "$filtered_fasta"
+  rm -f "$blast_out"
+  rm -f "$table_tsv"
+  rm -rf "$table_export_dir"
+
+  echo "Temporary files cleaned." | tee -a "$run_log"
+else
+  echo "Warning: final outputs missing. Temporary files were kept." | tee -a "$run_log"
+fi
+
+echo "===== Finished paired_ITS2 GlobalFungi-style test =====" | tee -a "$run_log"
+date | tee -a "$run_log"
+#2. 赋予运行权限
+chmod +x globalfungi_style_test/run_paired_ITS2_test.sh
+#3. 运行脚本
+bash globalfungi_style_test/run_paired_ITS2_test.sh
+#4. 跑完后看结果
+cat globalfungi_style_test/results/paired_ITS2_SH_mapping_stats.txt
+#再看最终 SH 表：
+head globalfungi_style_test/results/paired_ITS2_SH_table_globalfungi_style.tsv
+#看日志：
+less globalfungi_style_test/logs/paired_ITS2_run.log
+#5. 最终保留的关键文件
+#脚本会清理中间文件，只保留这些重要结果：
+#globalfungi_style_test/results/paired_ITS2_best_hits_globalfungi_style.tsv
+#globalfungi_style_test/results/paired_ITS2_SH_table_globalfungi_style.tsv
+#globalfungi_style_test/results/paired_ITS2_SH_mapping_stats.txt
+#globalfungi_style_test/logs/paired_ITS2_run.log
+#Terminated 大概率是因为后面 biom convert 把超大的 BIOM 转成 TSV 时占内存/磁盘太大，被 WSL 杀掉了。不要重新跑 BLAST，前面最耗时的部分已经成功了：Kept best hits: 759170
+#现在改成：直接读取 BIOM 稀疏表，把 feature 汇总到 SH，避免转成巨大 TSV。
+#1. 先删掉不再需要的超大中间文件
+#这几个已经不需要了，因为 best_hits 已经生成：
+cd /mnt/d/ITS_SH_pipeline
+
+rm -f globalfungi_style_test/fasta/paired_ITS2_derep_repseqs.fasta
+rm -f globalfungi_style_test/fasta/paired_ITS2_min40_noambig.fasta
+rm -f globalfungi_style_test/blast/paired_ITS2_vs_UNITE_SH.outfmt6
+#2. 新建稀疏 BIOM 汇总脚本
+nano globalfungi_style_test/scripts/collapse_biom_to_SH_sparse.py
+#粘贴：
+#!/usr/bin/env python3
+
+import sys
+import csv
+from collections import defaultdict
+from biom import load_table
+from biom.util import biom_open
+
+best_hits_file = sys.argv[1]
+biom_file = sys.argv[2]
+out_biom = sys.argv[3]
+stats_file = sys.argv[4]
+
+feature_to_sh = {}
+
+with open(best_hits_file, "r", newline="") as f:
+    reader = csv.DictReader(f, delimiter="\t")
+    for row in reader:
+        feature_to_sh[row["feature_id"]] = row["sh_id"]
+
+print(f"Mapped features in best-hit file: {len(feature_to_sh)}")
+
+print("Loading BIOM table...")
+table = load_table(biom_file)
+
+total_features = len(table.ids(axis="observation"))
+print(f"Total features in BIOM table: {total_features}")
+
+mapped_ids = [fid for fid in table.ids(axis="observation") if fid in feature_to_sh]
+mapped_set = set(mapped_ids)
+
+print(f"Mapped features present in BIOM table: {len(mapped_ids)}")
+
+print("Filtering table to mapped features only...")
+mapped_table = table.filter(mapped_ids, axis="observation", inplace=False)
+
+print("Adding SH metadata...")
+obs_metadata = {
+    fid: {"SH_ID": feature_to_sh[fid]}
+    for fid in mapped_table.ids(axis="observation")
+}
+mapped_table.add_metadata(obs_metadata, axis="observation")
+
+print("Collapsing features to SH level...")
+sh_table = mapped_table.collapse(
+    lambda id_, md: md["SH_ID"],
+    axis="observation",
+    norm=False,
+    include_collapsed_metadata=False
+)
+
+print("Writing SH BIOM table...")
+with biom_open(out_biom, "w") as f:
+    sh_table.to_hdf5(f, generated_by="collapse_biom_to_SH_sparse.py")
+
+with open(stats_file, "w") as s:
+    s.write(f"total_features_in_table\t{total_features}\n")
+    s.write(f"mapped_features_in_best_hit_file\t{len(feature_to_sh)}\n")
+    s.write(f"mapped_features_present_in_table\t{len(mapped_ids)}\n")
+    s.write(f"unmapped_features_in_table\t{total_features - len(mapped_ids)}\n")
+    if total_features > 0:
+        s.write(f"mapped_feature_percent\t{len(mapped_ids) / total_features * 100:.4f}\n")
+    s.write(f"SH_count\t{len(sh_table.ids(axis='observation'))}\n")
+    s.write(f"sample_count\t{len(sh_table.ids(axis='sample'))}\n")
+
+print(f"Done: {out_biom}")
+print(f"Stats: {stats_file}")
+#3. 直接从已导出的 BIOM 汇总到 SH
+#你已经有这个目录：
+globalfungi_style_test/tables/paired_ITS2_derep_table_exported
+#所以直接运行：
+python globalfungi_style_test/scripts/collapse_biom_to_SH_sparse.py \
+  globalfungi_style_test/results/paired_ITS2_best_hits_globalfungi_style.tsv \
+  globalfungi_style_test/tables/paired_ITS2_derep_table_exported/feature-table.biom \
+  globalfungi_style_test/results/paired_ITS2_SH_table_globalfungi_style.biom \
+  globalfungi_style_test/results/paired_ITS2_SH_mapping_stats.txt
+#4. 看结果
+cat globalfungi_style_test/results/paired_ITS2_SH_mapping_stats.txt
+#如果成功，再看 BIOM 表概况：
+biom summarize-table \
+  -i globalfungi_style_test/results/paired_ITS2_SH_table_globalfungi_style.biom
+#5. 成功后再清理导出的 table
+#确认上一步成功后，可以删：
+rm -rf globalfungi_style_test/tables/paired_ITS2_derep_table_exported
+#这次不要再把大 BIOM 转 TSV 了。后面全量脚本也应该改成直接 BIOM 稀疏汇总。
