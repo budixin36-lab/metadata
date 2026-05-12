@@ -883,3 +883,4 @@ biom summarize-table \
 #确认上一步成功后，可以删：
 rm -rf globalfungi_style_test/tables/paired_ITS2_derep_table_exported
 #这次不要再把大 BIOM 转 TSV 了。后面全量脚本也应该改成直接 BIOM 稀疏汇总。
+#paired_ITS2 用 GlobalFungi-style 阈值后，约 36.34% 的 derep features 被映射到 7559 个 SH，比你之前 single_ITS2 的 7.19% 高很多。
