@@ -1,0 +1,1509 @@
+#这一步建议一次性生成：
+#alpha_diversity_ACE_Chao1_Shannon_Simpson.csv：每个样本的 alpha 指数
+#Table3_1_host_family_alpha_ANOVA_TukeyHSD.xlsx：宿主科水平 alpha 指数均值 ± SD + ANOVA + TukeyHSD
+#Table3_2_host_species_alpha_ANOVA_TukeyHSD.xlsx：宿主物种水平 alpha 指数均值 ± SD + ANOVA + TukeyHSD
+#可选箱线图：宿主科、宿主物种 alpha 多样性箱线图
+#1. 新建脚本
+cd /mnt/d/ITS_SH_pipeline
+nano scripts/05_alpha_diversity_anova_tukey.R
+#复制下面完整代码：
+# ============================================================
+# Chapter 3 alpha diversity
+# Table 3-1: host_family alpha indices + ANOVA + TukeyHSD
+# Table 3-2: host_species alpha indices + ANOVA + TukeyHSD
+# Optional: alpha diversity boxplots
+#
+# Metrics: ACE, Chao1, Shannon, Simpson
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(biomformat)
+  library(tidyverse)
+  library(vegan)
+  library(openxlsx)
+})
+
+base_dir <- "/mnt/d/ITS_SH_pipeline/globalfungi_style_test"
+
+biom_file <- file.path(
+  base_dir,
+  "taxonomy/merged_SH_globalfungi_style_nozero_with_taxonomy.biom"
+)
+
+metadata_file <- file.path(
+  base_dir,
+  "metadata/metadata_valid_globalfungi_SH_nozero.csv"
+)
+
+out_dir <- file.path(
+  base_dir,
+  "results/chapter3_alpha_diversity"
+)
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+species_min_n <- 1
+
+metrics <- c("ACE", "Chao1", "Shannon", "Simpson")
+
+# -----------------------------
+# 1. Read metadata
+# -----------------------------
+meta <- read.csv(
+  metadata_file,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+possible_sample_cols <- c("sample_id", "SampleID", "sampleid", "sample_name", "id", "#SampleID")
+sample_col <- possible_sample_cols[possible_sample_cols %in% colnames(meta)][1]
+
+if (is.na(sample_col)) {
+  stop("没有找到样本 ID 列，请检查 metadata。")
+}
+
+if (!"host_family" %in% colnames(meta)) {
+  stop("metadata 中没有 host_family 列。")
+}
+
+if (!"host_species" %in% colnames(meta)) {
+  stop("metadata 中没有 host_species 列。")
+}
+
+meta <- meta %>%
+  mutate(
+    sample_id = as.character(.data[[sample_col]]),
+    host_family = trimws(as.character(host_family)),
+    host_species = trimws(as.character(host_species))
+  ) %>%
+  filter(
+    !is.na(sample_id), sample_id != "",
+    !is.na(host_family), host_family != "",
+    !is.na(host_species), host_species != "",
+    host_family != "NA",
+    host_species != "NA",
+    host_family != "missing",
+    host_species != "missing",
+    host_family != "not_recorded",
+    host_species != "not_recorded",
+    host_family != "not reported",
+    host_species != "not reported"
+  ) %>%
+  distinct(sample_id, .keep_all = TRUE)
+
+# -----------------------------
+# 2. Read BIOM
+# -----------------------------
+biom <- read_biom(biom_file)
+mat <- as(biom_data(biom), "matrix")  # feature x sample
+
+common_samples <- intersect(colnames(mat), meta$sample_id)
+
+if (length(common_samples) == 0) {
+  stop("BIOM 和 metadata 没有匹配到共同样本。")
+}
+
+mat <- mat[, common_samples, drop = FALSE]
+
+meta2 <- meta %>%
+  filter(sample_id %in% common_samples)
+
+meta2 <- meta2[match(colnames(mat), meta2$sample_id), ]
+
+cat("Matched samples:", ncol(mat), "\n")
+cat("SH number:", nrow(mat), "\n")
+cat("Host family number:", length(unique(meta2$host_family)), "\n")
+cat("Host species number:", length(unique(meta2$host_species)), "\n")
+
+if (any(colSums(mat) == 0)) {
+  stop("仍存在总 reads 为 0 的样本，请检查 nozero biom。")
+}
+
+# vegan 要求 sample x feature
+comm <- t(mat)
+
+# -----------------------------
+# 3. Alpha diversity indices
+# -----------------------------
+est <- estimateR(comm)
+
+alpha_df <- data.frame(
+  sample_id = rownames(comm),
+  Observed_SH = specnumber(comm),
+  ACE = as.numeric(est["S.ACE", ]),
+  Chao1 = as.numeric(est["S.chao1", ]),
+  Shannon = diversity(comm, index = "shannon"),
+  Simpson = diversity(comm, index = "simpson"),
+  stringsAsFactors = FALSE
+)
+
+alpha_df <- alpha_df %>%
+  left_join(
+    meta2 %>% select(sample_id, host_family, host_species),
+    by = "sample_id"
+  )
+
+write.csv(
+  alpha_df,
+  file.path(out_dir, "alpha_diversity_ACE_Chao1_Shannon_Simpson.csv"),
+  row.names = FALSE
+)
+
+# -----------------------------
+# 4. Summary table: mean ± SD
+# -----------------------------
+make_alpha_summary <- function(df, group_col) {
+  df %>%
+    group_by(.data[[group_col]]) %>%
+    summarise(
+      n = n(),
+      ACE_mean = mean(ACE, na.rm = TRUE),
+      ACE_sd = sd(ACE, na.rm = TRUE),
+      Chao1_mean = mean(Chao1, na.rm = TRUE),
+      Chao1_sd = sd(Chao1, na.rm = TRUE),
+      Shannon_mean = mean(Shannon, na.rm = TRUE),
+      Shannon_sd = sd(Shannon, na.rm = TRUE),
+      Simpson_mean = mean(Simpson, na.rm = TRUE),
+      Simpson_sd = sd(Simpson, na.rm = TRUE),
+      ACE_mean_sd = sprintf("%.2f ± %.2f", ACE_mean, ACE_sd),
+      Chao1_mean_sd = sprintf("%.2f ± %.2f", Chao1_mean, Chao1_sd),
+      Shannon_mean_sd = sprintf("%.2f ± %.2f", Shannon_mean, Shannon_sd),
+      Simpson_mean_sd = sprintf("%.4f ± %.4f", Simpson_mean, Simpson_sd),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(n))
+}
+
+# -----------------------------
+# 5. ANOVA table
+# -----------------------------
+run_anova_table <- function(df, group_col, metrics) {
+  out <- list()
+
+  for (m in metrics) {
+    dat <- df %>%
+      select(value = all_of(m), group = all_of(group_col)) %>%
+      filter(!is.na(value), !is.na(group), group != "")
+
+    dat$group <- factor(dat$group)
+
+    fit <- aov(value ~ group, data = dat)
+    sm <- summary(fit)[[1]]
+
+    p <- sm["group", "Pr(>F)"]
+
+    out[[m]] <- data.frame(
+      metric = m,
+      group_variable = group_col,
+      Df_between = sm["group", "Df"],
+      Df_within = sm["Residuals", "Df"],
+      F_value = sm["group", "F value"],
+      P_value = p,
+      significance = case_when(
+        p < 0.001 ~ "***",
+        p < 0.01 ~ "**",
+        p < 0.05 ~ "*",
+        TRUE ~ "ns"
+      ),
+      stringsAsFactors = FALSE
+    )
+  }
+
+  bind_rows(out)
+}
+
+# -----------------------------
+# 6. TukeyHSD table
+# -----------------------------
+run_tukey_table <- function(df, group_col, metrics, only_significant = FALSE) {
+  out <- list()
+
+  for (m in metrics) {
+    dat <- df %>%
+      select(value = all_of(m), group = all_of(group_col)) %>%
+      filter(!is.na(value), !is.na(group), group != "")
+
+    dat$group <- factor(dat$group)
+
+    fit <- aov(value ~ group, data = dat)
+    tk <- TukeyHSD(fit)$group
+
+    tk_df <- as.data.frame(tk) %>%
+      rownames_to_column("comparison") %>%
+      mutate(
+        metric = m,
+        group_variable = group_col,
+        significance = case_when(
+          `p adj` < 0.001 ~ "***",
+          `p adj` < 0.01 ~ "**",
+          `p adj` < 0.05 ~ "*",
+          TRUE ~ "ns"
+        )
+      ) %>%
+      select(
+        metric,
+        group_variable,
+        comparison,
+        diff,
+        lwr,
+        upr,
+        p_adj = `p adj`,
+        significance
+      )
+
+    if (only_significant) {
+      tk_df <- tk_df %>% filter(p_adj < 0.05)
+    }
+
+    out[[m]] <- tk_df
+  }
+
+  bind_rows(out)
+}
+
+# -----------------------------
+# 7. Prepare family and species datasets
+# -----------------------------
+alpha_family <- alpha_df %>%
+  filter(!is.na(host_family), host_family != "")
+
+species_keep <- alpha_df %>%
+  count(host_species, sort = TRUE) %>%
+  filter(n >= species_min_n) %>%
+  pull(host_species)
+
+alpha_species <- alpha_df %>%
+  filter(host_species %in% species_keep)
+
+write.csv(
+  alpha_df %>% count(host_family, sort = TRUE),
+  file.path(out_dir, "host_family_sample_count_for_alpha.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  alpha_df %>% count(host_species, sort = TRUE),
+  file.path(out_dir, "host_species_sample_count_for_alpha_all.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  alpha_species %>% count(host_species, sort = TRUE),
+  file.path(out_dir, paste0("host_species_sample_count_for_alpha_n_ge_", species_min_n, ".csv")),
+  row.names = FALSE
+)
+
+cat("Species retained for alpha analysis, n >=", species_min_n, ":", length(species_keep), "\n")
+
+# -----------------------------
+# 8. Generate tables
+# -----------------------------
+family_summary <- make_alpha_summary(alpha_family, "host_family")
+family_anova <- run_anova_table(alpha_family, "host_family", metrics)
+family_tukey_all <- run_tukey_table(alpha_family, "host_family", metrics, only_significant = FALSE)
+family_tukey_sig <- run_tukey_table(alpha_family, "host_family", metrics, only_significant = TRUE)
+
+species_summary <- make_alpha_summary(alpha_species, "host_species")
+species_anova <- run_anova_table(alpha_species, "host_species", metrics)
+species_tukey_all <- run_tukey_table(alpha_species, "host_species", metrics, only_significant = FALSE)
+species_tukey_sig <- run_tukey_table(alpha_species, "host_species", metrics, only_significant = TRUE)
+
+# CSV outputs
+write.csv(family_summary, file.path(out_dir, "Table3_1_host_family_alpha_summary.csv"), row.names = FALSE)
+write.csv(family_anova, file.path(out_dir, "Table3_1_host_family_alpha_ANOVA.csv"), row.names = FALSE)
+write.csv(family_tukey_all, file.path(out_dir, "Table3_1_host_family_alpha_TukeyHSD_all.csv"), row.names = FALSE)
+write.csv(family_tukey_sig, file.path(out_dir, "Table3_1_host_family_alpha_TukeyHSD_significant.csv"), row.names = FALSE)
+
+write.csv(species_summary, file.path(out_dir, "Table3_2_host_species_alpha_summary.csv"), row.names = FALSE)
+write.csv(species_anova, file.path(out_dir, "Table3_2_host_species_alpha_ANOVA.csv"), row.names = FALSE)
+write.csv(species_tukey_all, file.path(out_dir, "Table3_2_host_species_alpha_TukeyHSD_all.csv"), row.names = FALSE)
+write.csv(species_tukey_sig, file.path(out_dir, "Table3_2_host_species_alpha_TukeyHSD_significant.csv"), row.names = FALSE)
+
+# Excel outputs
+wb1 <- createWorkbook()
+addWorksheet(wb1, "alpha_mean_sd")
+addWorksheet(wb1, "ANOVA")
+addWorksheet(wb1, "TukeyHSD_significant")
+addWorksheet(wb1, "TukeyHSD_all")
+writeData(wb1, "alpha_mean_sd", family_summary)
+writeData(wb1, "ANOVA", family_anova)
+writeData(wb1, "TukeyHSD_significant", family_tukey_sig)
+writeData(wb1, "TukeyHSD_all", family_tukey_all)
+setColWidths(wb1, 1:4, cols = 1:20, widths = "auto")
+saveWorkbook(
+  wb1,
+  file.path(out_dir, "Table3_1_host_family_alpha_indices_ANOVA_TukeyHSD.xlsx"),
+  overwrite = TRUE
+)
+
+wb2 <- createWorkbook()
+addWorksheet(wb2, "alpha_mean_sd")
+addWorksheet(wb2, "ANOVA")
+addWorksheet(wb2, "TukeyHSD_significant")
+addWorksheet(wb2, "TukeyHSD_all")
+addWorksheet(wb2, "species_included")
+writeData(wb2, "alpha_mean_sd", species_summary)
+writeData(wb2, "ANOVA", species_anova)
+writeData(wb2, "TukeyHSD_significant", species_tukey_sig)
+writeData(wb2, "TukeyHSD_all", species_tukey_all)
+writeData(wb2, "species_included", alpha_species %>% count(host_species, sort = TRUE))
+setColWidths(wb2, 1:5, cols = 1:20, widths = "auto")
+saveWorkbook(
+  wb2,
+  file.path(out_dir, paste0("Table3_2_host_species_alpha_indices_ANOVA_TukeyHSD_n_ge_", species_min_n, ".xlsx")),
+  overwrite = TRUE
+)
+
+# -----------------------------
+# 9. Optional boxplots
+# -----------------------------
+plot_alpha_box <- function(df, group_col, output_prefix, x_angle = 30) {
+  plot_df <- df %>%
+    select(all_of(group_col), all_of(metrics)) %>%
+    pivot_longer(
+      cols = all_of(metrics),
+      names_to = "metric",
+      values_to = "value"
+    ) %>%
+    filter(!is.na(value), !is.na(.data[[group_col]]), .data[[group_col]] != "")
+
+  group_order <- df %>%
+    count(.data[[group_col]], sort = TRUE) %>%
+    pull(.data[[group_col]])
+
+  plot_df[[group_col]] <- factor(plot_df[[group_col]], levels = group_order)
+  plot_df$metric <- factor(plot_df$metric, levels = metrics)
+
+  p <- ggplot(plot_df, aes(x = .data[[group_col]], y = value, fill = .data[[group_col]])) +
+    geom_boxplot(width = 0.65, outlier.shape = NA) +
+    facet_wrap(~ metric, scales = "free_y", ncol = 2) +
+    labs(
+      x = NULL,
+      y = "Alpha diversity index"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      axis.text.x = element_text(angle = x_angle, hjust = 1),
+      legend.position = "none",
+      strip.background = element_blank(),
+      strip.text = element_text(size = 12)
+    )
+
+  ggsave(
+    file.path(out_dir, paste0(output_prefix, ".pdf")),
+    p,
+    width = ifelse(group_col == "host_species", 12, 8),
+    height = ifelse(group_col == "host_species", 7, 6)
+  )
+
+  ggsave(
+    file.path(out_dir, paste0(output_prefix, ".png")),
+    p,
+    width = ifelse(group_col == "host_species", 12, 8),
+    height = ifelse(group_col == "host_species", 7, 6),
+    dpi = 300
+  )
+}
+
+plot_alpha_box(
+  alpha_family,
+  "host_family",
+  "Fig3_6_host_family_alpha_diversity_boxplot",
+  x_angle = 30
+)
+
+plot_alpha_box(
+  alpha_species,
+  "host_species",
+  paste0("Fig3_7_host_species_alpha_diversity_boxplot_n_ge_", species_min_n),
+  x_angle = 45
+)
+
+# -----------------------------
+# 10. Summary
+# -----------------------------
+sink(file.path(out_dir, "alpha_diversity_analysis_summary.txt"))
+cat("Alpha diversity analysis summary\n")
+cat("================================\n\n")
+cat("Input biom:\n", biom_file, "\n\n")
+cat("Input metadata:\n", metadata_file, "\n\n")
+cat("Matched samples:", ncol(mat), "\n")
+cat("SH number:", nrow(mat), "\n\n")
+
+cat("Host family sample counts:\n")
+print(alpha_df %>% count(host_family, sort = TRUE))
+
+cat("\nHost species sample counts, all:\n")
+print(alpha_df %>% count(host_species, sort = TRUE))
+
+cat("\nSpecies retained for species-level analysis, n >= ", species_min_n, ":\n", sep = "")
+print(alpha_species %>% count(host_species, sort = TRUE))
+
+cat("\nHost family ANOVA:\n")
+print(family_anova)
+
+cat("\nHost species ANOVA:\n")
+print(species_anova)
+
+cat("\nSignificant host family TukeyHSD results:\n")
+print(family_tukey_sig)
+
+cat("\nSignificant host species TukeyHSD results:\n")
+print(species_tukey_sig)
+sink()
+
+cat("\nDone!\n")
+cat("Output directory:\n", out_dir, "\n")
+#2. 如果缺包，安装 openxlsx 和 vegan
+#如果你之前没装过：
+R
+  
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+install.packages(c("vegan", "openxlsx"))
+q()
+#如果提示保存 workspace，输入：
+n
+#3. 运行脚本
+Rscript scripts/05_alpha_diversity_anova_tukey.R
+#4. 主要输出文件
+#输出目录：
+#/mnt/d/ITS_SH_pipeline/globalfungi_style_test/results/chapter3_alpha_diversity
+#重点看这几个：
+#样本 alpha 指数总表
+#alpha_diversity_ACE_Chao1_Shannon_Simpson.csv
+#表3-1：宿主科水平
+#Table3_1_host_family_alpha_indices_ANOVA_TukeyHSD.xlsx
+#里面有 4 个 sheet：
+#alpha_mean_sd
+#ANOVA
+#TukeyHSD_significant
+#TukeyHSD_all
+#表3-2：宿主物种水平
+#Table3_2_host_species_alpha_indices_ANOVA_TukeyHSD_n_ge_10.xlsx
+#里面有 5 个 sheet：
+#alpha_mean_sd
+#ANOVA
+#TukeyHSD_significant
+#TukeyHSD_all
+#species_included
+#箱线图
+#Fig3_6_host_family_alpha_diversity_boxplot.pdf
+#Fig3_6_host_family_alpha_diversity_boxplot.png
+#Fig3_7_host_species_alpha_diversity_boxplot_n_ge_10.pdf
+#Fig3_7_host_species_alpha_diversity_boxplot_n_ge_10.png
+#5. 解释重点
+#这个脚本没有做 rarefaction，直接基于最终 SH abundance table 计算 alpha 指数。
+#真正报错在这两行：
+#setColWidths(wb1, 1:4, cols = 1:20, widths = "auto")
+#setColWidths(wb2, 1:5, cols = 1:20, widths = "auto")
+#openxlsx::setColWidths() 不能一次写 1:4 或 1:5，要改成循环。
+#接重新覆盖整个脚本。在 WSL 终端运行下面命令即可。
+#先进入项目目录：
+cd /mnt/d/ITS_SH_pipeline
+#然后直接用下面命令覆盖脚本：
+cat > scripts/05_alpha_diversity_anova_tukey.R <<'EOF'
+# ============================================================
+# Chapter 3 alpha diversity
+# Table 3-1: host_family alpha indices + ANOVA + TukeyHSD
+# Table 3-2: host_species alpha indices + ANOVA + TukeyHSD
+# Boxplots: host_family and host_species alpha diversity
+#
+# Metrics: ACE, Chao1, Shannon, Simpson
+# Note: host_species analysis includes ALL species, species_min_n = 1
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(biomformat)
+  library(tidyverse)
+  library(vegan)
+  library(openxlsx)
+})
+
+base_dir <- "/mnt/d/ITS_SH_pipeline/globalfungi_style_test"
+
+biom_file <- file.path(
+  base_dir,
+  "taxonomy/merged_SH_globalfungi_style_nozero_with_taxonomy.biom"
+)
+
+metadata_file <- file.path(
+  base_dir,
+  "metadata/metadata_valid_globalfungi_SH_nozero.csv"
+)
+
+out_dir <- file.path(
+  base_dir,
+  "results/chapter3_alpha_diversity"
+)
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# 物种水平纳入所有物种
+species_min_n <- 1
+
+metrics <- c("ACE", "Chao1", "Shannon", "Simpson")
+
+# -----------------------------
+# 1. Read metadata
+# -----------------------------
+meta <- read.csv(
+  metadata_file,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+possible_sample_cols <- c("sample_id", "SampleID", "sampleid", "sample_name", "id", "#SampleID")
+sample_col <- possible_sample_cols[possible_sample_cols %in% colnames(meta)][1]
+
+if (is.na(sample_col)) {
+  stop("没有找到样本 ID 列，请检查 metadata。")
+}
+
+if (!"host_family" %in% colnames(meta)) {
+  stop("metadata 中没有 host_family 列。")
+}
+
+if (!"host_species" %in% colnames(meta)) {
+  stop("metadata 中没有 host_species 列。")
+}
+
+meta <- meta %>%
+  mutate(
+    sample_id = as.character(.data[[sample_col]]),
+    host_family = trimws(as.character(host_family)),
+    host_species = trimws(as.character(host_species))
+  ) %>%
+  filter(
+    !is.na(sample_id), sample_id != "",
+    !is.na(host_family), host_family != "",
+    !is.na(host_species), host_species != "",
+    host_family != "NA",
+    host_species != "NA",
+    host_family != "missing",
+    host_species != "missing",
+    host_family != "not_recorded",
+    host_species != "not_recorded",
+    host_family != "not reported",
+    host_species != "not reported"
+  ) %>%
+  distinct(sample_id, .keep_all = TRUE)
+
+# -----------------------------
+# 2. Read BIOM
+# -----------------------------
+biom <- read_biom(biom_file)
+mat <- as(biom_data(biom), "matrix")  # feature x sample
+
+common_samples <- intersect(colnames(mat), meta$sample_id)
+
+if (length(common_samples) == 0) {
+  stop("BIOM 和 metadata 没有匹配到共同样本。")
+}
+
+mat <- mat[, common_samples, drop = FALSE]
+
+meta2 <- meta %>%
+  filter(sample_id %in% common_samples)
+
+meta2 <- meta2[match(colnames(mat), meta2$sample_id), ]
+
+cat("Matched samples:", ncol(mat), "\n")
+cat("SH number:", nrow(mat), "\n")
+cat("Host family number:", length(unique(meta2$host_family)), "\n")
+cat("Host species number:", length(unique(meta2$host_species)), "\n")
+
+if (any(colSums(mat) == 0)) {
+  stop("仍存在总 reads 为 0 的样本，请检查 nozero biom。")
+}
+
+# vegan 要求 sample x feature
+comm <- t(mat)
+
+# -----------------------------
+# 3. Alpha diversity indices
+# -----------------------------
+est <- estimateR(comm)
+
+alpha_df <- data.frame(
+  sample_id = rownames(comm),
+  Observed_SH = specnumber(comm),
+  ACE = as.numeric(est["S.ACE", ]),
+  Chao1 = as.numeric(est["S.chao1", ]),
+  Shannon = diversity(comm, index = "shannon"),
+  Simpson = diversity(comm, index = "simpson"),
+  stringsAsFactors = FALSE
+)
+
+alpha_df <- alpha_df %>%
+  left_join(
+    meta2 %>% select(sample_id, host_family, host_species),
+    by = "sample_id"
+  )
+
+write.csv(
+  alpha_df,
+  file.path(out_dir, "alpha_diversity_ACE_Chao1_Shannon_Simpson.csv"),
+  row.names = FALSE
+)
+
+# -----------------------------
+# 4. Summary table: mean ± SD
+# -----------------------------
+make_alpha_summary <- function(df, group_col) {
+  df %>%
+    group_by(.data[[group_col]]) %>%
+    summarise(
+      n = n(),
+      ACE_mean = mean(ACE, na.rm = TRUE),
+      ACE_sd = sd(ACE, na.rm = TRUE),
+      Chao1_mean = mean(Chao1, na.rm = TRUE),
+      Chao1_sd = sd(Chao1, na.rm = TRUE),
+      Shannon_mean = mean(Shannon, na.rm = TRUE),
+      Shannon_sd = sd(Shannon, na.rm = TRUE),
+      Simpson_mean = mean(Simpson, na.rm = TRUE),
+      Simpson_sd = sd(Simpson, na.rm = TRUE),
+      ACE_mean_sd = sprintf("%.2f ± %.2f", ACE_mean, ACE_sd),
+      Chao1_mean_sd = sprintf("%.2f ± %.2f", Chao1_mean, Chao1_sd),
+      Shannon_mean_sd = sprintf("%.2f ± %.2f", Shannon_mean, Shannon_sd),
+      Simpson_mean_sd = sprintf("%.4f ± %.4f", Simpson_mean, Simpson_sd),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(n))
+}
+
+# -----------------------------
+# 5. ANOVA table
+# -----------------------------
+run_anova_table <- function(df, group_col, metrics) {
+  out <- list()
+
+  for (m in metrics) {
+    dat <- df %>%
+      select(value = all_of(m), group = all_of(group_col)) %>%
+      filter(!is.na(value), !is.na(group), group != "")
+
+    dat$group <- factor(dat$group)
+
+    fit <- aov(value ~ group, data = dat)
+    sm <- summary(fit)[[1]]
+
+    p <- sm["group", "Pr(>F)"]
+
+    out[[m]] <- data.frame(
+      metric = m,
+      group_variable = group_col,
+      Df_between = sm["group", "Df"],
+      Df_within = sm["Residuals", "Df"],
+      F_value = sm["group", "F value"],
+      P_value = p,
+      significance = case_when(
+        p < 0.001 ~ "***",
+        p < 0.01 ~ "**",
+        p < 0.05 ~ "*",
+        TRUE ~ "ns"
+      ),
+      stringsAsFactors = FALSE
+    )
+  }
+
+  bind_rows(out)
+}
+
+# -----------------------------
+# 6. TukeyHSD table
+# -----------------------------
+run_tukey_table <- function(df, group_col, metrics, only_significant = FALSE) {
+  out <- list()
+
+  for (m in metrics) {
+    dat <- df %>%
+      select(value = all_of(m), group = all_of(group_col)) %>%
+      filter(!is.na(value), !is.na(group), group != "")
+
+    dat$group <- factor(dat$group)
+
+    fit <- aov(value ~ group, data = dat)
+    tk <- TukeyHSD(fit)$group
+
+    tk_df <- as.data.frame(tk) %>%
+      rownames_to_column("comparison") %>%
+      mutate(
+        metric = m,
+        group_variable = group_col,
+        significance = case_when(
+          `p adj` < 0.001 ~ "***",
+          `p adj` < 0.01 ~ "**",
+          `p adj` < 0.05 ~ "*",
+          TRUE ~ "ns"
+        )
+      ) %>%
+      select(
+        metric,
+        group_variable,
+        comparison,
+        diff,
+        lwr,
+        upr,
+        p_adj = `p adj`,
+        significance
+      )
+
+    if (only_significant) {
+      tk_df <- tk_df %>% filter(p_adj < 0.05)
+    }
+
+    out[[m]] <- tk_df
+  }
+
+  bind_rows(out)
+}
+
+# -----------------------------
+# 7. Prepare family and species datasets
+# -----------------------------
+alpha_family <- alpha_df %>%
+  filter(!is.na(host_family), host_family != "")
+
+species_keep <- alpha_df %>%
+  count(host_species, sort = TRUE) %>%
+  filter(n >= species_min_n) %>%
+  pull(host_species)
+
+alpha_species <- alpha_df %>%
+  filter(host_species %in% species_keep)
+
+write.csv(
+  alpha_df %>% count(host_family, sort = TRUE),
+  file.path(out_dir, "host_family_sample_count_for_alpha.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  alpha_df %>% count(host_species, sort = TRUE),
+  file.path(out_dir, "host_species_sample_count_for_alpha_all.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  alpha_species %>% count(host_species, sort = TRUE),
+  file.path(out_dir, paste0("host_species_sample_count_for_alpha_n_ge_", species_min_n, ".csv")),
+  row.names = FALSE
+)
+
+cat("Species retained for alpha analysis, n >=", species_min_n, ":", length(species_keep), "\n")
+
+# -----------------------------
+# 8. Generate statistical tables
+# -----------------------------
+family_summary <- make_alpha_summary(alpha_family, "host_family")
+family_anova <- run_anova_table(alpha_family, "host_family", metrics)
+family_tukey_all <- run_tukey_table(alpha_family, "host_family", metrics, only_significant = FALSE)
+family_tukey_sig <- run_tukey_table(alpha_family, "host_family", metrics, only_significant = TRUE)
+
+species_summary <- make_alpha_summary(alpha_species, "host_species")
+species_anova <- run_anova_table(alpha_species, "host_species", metrics)
+species_tukey_all <- run_tukey_table(alpha_species, "host_species", metrics, only_significant = FALSE)
+species_tukey_sig <- run_tukey_table(alpha_species, "host_species", metrics, only_significant = TRUE)
+
+# CSV outputs
+write.csv(family_summary, file.path(out_dir, "Table3_1_host_family_alpha_summary.csv"), row.names = FALSE)
+write.csv(family_anova, file.path(out_dir, "Table3_1_host_family_alpha_ANOVA.csv"), row.names = FALSE)
+write.csv(family_tukey_all, file.path(out_dir, "Table3_1_host_family_alpha_TukeyHSD_all.csv"), row.names = FALSE)
+write.csv(family_tukey_sig, file.path(out_dir, "Table3_1_host_family_alpha_TukeyHSD_significant.csv"), row.names = FALSE)
+
+write.csv(species_summary, file.path(out_dir, "Table3_2_host_species_alpha_summary.csv"), row.names = FALSE)
+write.csv(species_anova, file.path(out_dir, "Table3_2_host_species_alpha_ANOVA.csv"), row.names = FALSE)
+write.csv(species_tukey_all, file.path(out_dir, "Table3_2_host_species_alpha_TukeyHSD_all.csv"), row.names = FALSE)
+write.csv(species_tukey_sig, file.path(out_dir, "Table3_2_host_species_alpha_TukeyHSD_significant.csv"), row.names = FALSE)
+
+# -----------------------------
+# 9. Excel outputs
+# -----------------------------
+wb1 <- createWorkbook()
+addWorksheet(wb1, "alpha_mean_sd")
+addWorksheet(wb1, "ANOVA")
+addWorksheet(wb1, "TukeyHSD_significant")
+addWorksheet(wb1, "TukeyHSD_all")
+
+writeData(wb1, "alpha_mean_sd", family_summary)
+writeData(wb1, "ANOVA", family_anova)
+writeData(wb1, "TukeyHSD_significant", family_tukey_sig)
+writeData(wb1, "TukeyHSD_all", family_tukey_all)
+
+for (s in names(wb1)) {
+  setColWidths(wb1, sheet = s, cols = 1:20, widths = "auto")
+}
+
+saveWorkbook(
+  wb1,
+  file.path(out_dir, "Table3_1_host_family_alpha_indices_ANOVA_TukeyHSD.xlsx"),
+  overwrite = TRUE
+)
+
+wb2 <- createWorkbook()
+addWorksheet(wb2, "alpha_mean_sd")
+addWorksheet(wb2, "ANOVA")
+addWorksheet(wb2, "TukeyHSD_significant")
+addWorksheet(wb2, "TukeyHSD_all")
+addWorksheet(wb2, "species_included")
+
+writeData(wb2, "alpha_mean_sd", species_summary)
+writeData(wb2, "ANOVA", species_anova)
+writeData(wb2, "TukeyHSD_significant", species_tukey_sig)
+writeData(wb2, "TukeyHSD_all", species_tukey_all)
+writeData(wb2, "species_included", alpha_species %>% count(host_species, sort = TRUE))
+
+for (s in names(wb2)) {
+  setColWidths(wb2, sheet = s, cols = 1:20, widths = "auto")
+}
+
+saveWorkbook(
+  wb2,
+  file.path(out_dir, paste0("Table3_2_host_species_alpha_indices_ANOVA_TukeyHSD_n_ge_", species_min_n, ".xlsx")),
+  overwrite = TRUE
+)
+
+# -----------------------------
+# 10. Boxplots
+# -----------------------------
+plot_alpha_box <- function(df, group_col, output_prefix, x_angle = 30) {
+  plot_df <- df %>%
+    select(all_of(group_col), all_of(metrics)) %>%
+    pivot_longer(
+      cols = all_of(metrics),
+      names_to = "metric",
+      values_to = "value"
+    ) %>%
+    filter(!is.na(value), !is.na(.data[[group_col]]), .data[[group_col]] != "")
+
+  group_order <- df %>%
+    count(.data[[group_col]], sort = TRUE) %>%
+    pull(.data[[group_col]])
+
+  plot_df[[group_col]] <- factor(plot_df[[group_col]], levels = group_order)
+  plot_df$metric <- factor(plot_df$metric, levels = metrics)
+
+  p <- ggplot(plot_df, aes(x = .data[[group_col]], y = value, fill = .data[[group_col]])) +
+    geom_boxplot(width = 0.65, outlier.shape = NA) +
+    facet_wrap(~ metric, scales = "free_y", ncol = 2) +
+    labs(
+      x = NULL,
+      y = "Alpha diversity index"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      axis.text.x = element_text(angle = x_angle, hjust = 1),
+      legend.position = "none",
+      strip.background = element_blank(),
+      strip.text = element_text(size = 12)
+    )
+
+  ggsave(
+    file.path(out_dir, paste0(output_prefix, ".pdf")),
+    p,
+    width = ifelse(group_col == "host_species", 14, 8),
+    height = ifelse(group_col == "host_species", 7.5, 6)
+  )
+
+  ggsave(
+    file.path(out_dir, paste0(output_prefix, ".png")),
+    p,
+    width = ifelse(group_col == "host_species", 14, 8),
+    height = ifelse(group_col == "host_species", 7.5, 6),
+    dpi = 300
+  )
+}
+
+plot_alpha_box(
+  alpha_family,
+  "host_family",
+  "Fig3_6_host_family_alpha_diversity_boxplot",
+  x_angle = 30
+)
+
+plot_alpha_box(
+  alpha_species,
+  "host_species",
+  paste0("Fig3_7_host_species_alpha_diversity_boxplot_n_ge_", species_min_n),
+  x_angle = 45
+)
+
+# -----------------------------
+# 11. Summary
+# -----------------------------
+sink(file.path(out_dir, "alpha_diversity_analysis_summary.txt"))
+cat("Alpha diversity analysis summary\n")
+cat("================================\n\n")
+cat("Input biom:\n", biom_file, "\n\n")
+cat("Input metadata:\n", metadata_file, "\n\n")
+cat("Matched samples:", ncol(mat), "\n")
+cat("SH number:", nrow(mat), "\n\n")
+
+cat("Host family sample counts:\n")
+print(alpha_df %>% count(host_family, sort = TRUE))
+
+cat("\nHost species sample counts, all:\n")
+print(alpha_df %>% count(host_species, sort = TRUE))
+
+cat("\nSpecies retained for species-level analysis, n >= ", species_min_n, ":\n", sep = "")
+print(alpha_species %>% count(host_species, sort = TRUE))
+
+cat("\nHost family ANOVA:\n")
+print(family_anova)
+
+cat("\nHost species ANOVA:\n")
+print(species_anova)
+
+cat("\nSignificant host family TukeyHSD results:\n")
+print(family_tukey_sig)
+
+cat("\nSignificant host species TukeyHSD results:\n")
+print(species_tukey_sig)
+sink()
+
+cat("\nDone!\n")
+cat("Output directory:\n", out_dir, "\n")
+EOF
+#然后重新运行：
+Rscript scripts/05_alpha_diversity_anova_tukey.R
+#直接新建一个专门给宿主科 alpha 箱线图加 TukeyHSD 显著性括号和星号的脚本。
+#这个脚本会读取你已经生成的：
+#alpha_diversity_ACE_Chao1_Shannon_Simpson.csv
+#Table3_1_host_family_alpha_TukeyHSD_significant.csv
+#然后重新生成带显著性标注的宿主科水平 alpha 箱线图。
+#1. 新建脚本
+cd /mnt/d/ITS_SH_pipeline
+nano scripts/05b_plot_host_family_alpha_with_significance.R
+#复制下面完整代码：
+# ============================================================
+# Add TukeyHSD significance brackets to host_family alpha boxplots
+# Metrics: ACE, Chao1, Shannon, Simpson
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+})
+
+base_dir <- "/mnt/d/ITS_SH_pipeline/globalfungi_style_test"
+
+out_dir <- file.path(
+  base_dir,
+  "results/chapter3_alpha_diversity"
+)
+
+alpha_file <- file.path(
+  out_dir,
+  "alpha_diversity_ACE_Chao1_Shannon_Simpson.csv"
+)
+
+tukey_sig_file <- file.path(
+  out_dir,
+  "Table3_1_host_family_alpha_TukeyHSD_significant.csv"
+)
+
+# -----------------------------
+# 1. Read data
+# -----------------------------
+alpha_df <- read.csv(
+  alpha_file,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+tukey_sig <- read.csv(
+  tukey_sig_file,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+metrics <- c("ACE", "Chao1", "Shannon", "Simpson")
+
+# 宿主科顺序：按样本数从多到少
+family_order <- alpha_df %>%
+  count(host_family, sort = TRUE) %>%
+  pull(host_family)
+
+# -----------------------------
+# 2. Long format for plotting
+# -----------------------------
+plot_df <- alpha_df %>%
+  select(sample_id, host_family, all_of(metrics)) %>%
+  pivot_longer(
+    cols = all_of(metrics),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  filter(
+    !is.na(value),
+    !is.na(host_family),
+    host_family != ""
+  ) %>%
+  mutate(
+    host_family = factor(host_family, levels = family_order),
+    x_num = as.numeric(host_family),
+    metric = factor(metric, levels = metrics)
+  )
+
+# -----------------------------
+# 3. Prepare TukeyHSD annotation
+# -----------------------------
+# Tukey comparison 格式通常为 "Suidae-Bovidae"
+anno_df <- tukey_sig %>%
+  filter(
+    metric %in% metrics,
+    p_adj < 0.05
+  ) %>%
+  separate(
+    comparison,
+    into = c("group1", "group2"),
+    sep = "-",
+    remove = FALSE
+  ) %>%
+  filter(
+    group1 %in% family_order,
+    group2 %in% family_order
+  ) %>%
+  mutate(
+    group1 = factor(group1, levels = family_order),
+    group2 = factor(group2, levels = family_order),
+    x1 = as.numeric(group1),
+    x2 = as.numeric(group2),
+    xmin = pmin(x1, x2),
+    xmax = pmax(x1, x2),
+    label = case_when(
+      p_adj < 0.001 ~ "***",
+      p_adj < 0.01 ~ "**",
+      p_adj < 0.05 ~ "*",
+      TRUE ~ "ns"
+    )
+  )
+
+# 每个 metric 内给括号分配不同高度，避免重叠
+if (nrow(anno_df) > 0) {
+  y_info <- plot_df %>%
+    group_by(metric) %>%
+    summarise(
+      y_max = max(value, na.rm = TRUE),
+      y_min = min(value, na.rm = TRUE),
+      y_range = y_max - y_min,
+      .groups = "drop"
+    ) %>%
+    mutate(
+      y_range = ifelse(y_range == 0, y_max * 0.1 + 1, y_range)
+    )
+
+  anno_df <- anno_df %>%
+    left_join(y_info, by = "metric") %>%
+    group_by(metric) %>%
+    arrange(xmin, xmax, p_adj, .by_group = TRUE) %>%
+    mutate(
+      bracket_id = row_number(),
+      y_position = y_max + y_range * 0.08 * bracket_id,
+      tick_height = y_range * 0.025,
+      label_y = y_position + y_range * 0.015
+    ) %>%
+    ungroup()
+}
+
+write.csv(
+  anno_df,
+  file.path(out_dir, "Fig3_6_host_family_alpha_significance_annotations.csv"),
+  row.names = FALSE
+)
+
+# -----------------------------
+# 4. Plot
+# -----------------------------
+p <- ggplot(plot_df, aes(x = x_num, y = value, fill = host_family)) +
+  geom_boxplot(
+    width = 0.65,
+    outlier.shape = NA,
+    linewidth = 0.5
+  ) +
+  facet_wrap(
+    ~ metric,
+    scales = "free_y",
+    ncol = 2
+  ) +
+  scale_x_continuous(
+    breaks = seq_along(family_order),
+    labels = family_order
+  ) +
+  labs(
+    x = NULL,
+    y = "Alpha diversity index"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    axis.text.x = element_text(angle = 35, hjust = 1, vjust = 1),
+    axis.title.y = element_text(size = 15),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 15),
+    legend.position = "none"
+  )
+
+# 添加显著性括号
+if (nrow(anno_df) > 0) {
+  p <- p +
+    geom_segment(
+      data = anno_df,
+      aes(x = xmin, xend = xmax, y = y_position, yend = y_position),
+      inherit.aes = FALSE,
+      linewidth = 0.4
+    ) +
+    geom_segment(
+      data = anno_df,
+      aes(x = xmin, xend = xmin, y = y_position, yend = y_position - tick_height),
+      inherit.aes = FALSE,
+      linewidth = 0.4
+    ) +
+    geom_segment(
+      data = anno_df,
+      aes(x = xmax, xend = xmax, y = y_position, yend = y_position - tick_height),
+      inherit.aes = FALSE,
+      linewidth = 0.4
+    ) +
+    geom_text(
+      data = anno_df,
+      aes(x = (xmin + xmax) / 2, y = label_y, label = label),
+      inherit.aes = FALSE,
+      size = 4
+    )
+}
+
+# -----------------------------
+# 5. Save
+# -----------------------------
+ggsave(
+  file.path(out_dir, "Fig3_6_host_family_alpha_diversity_boxplot_with_Tukey_significance.pdf"),
+  p,
+  width = 9,
+  height = 7.5
+)
+
+ggsave(
+  file.path(out_dir, "Fig3_6_host_family_alpha_diversity_boxplot_with_Tukey_significance.png"),
+  p,
+  width = 9,
+  height = 7.5,
+  dpi = 300
+)
+
+cat("\nDone!\n")
+cat("Output files:\n")
+cat(file.path(out_dir, "Fig3_6_host_family_alpha_diversity_boxplot_with_Tukey_significance.pdf"), "\n")
+cat(file.path(out_dir, "Fig3_6_host_family_alpha_diversity_boxplot_with_Tukey_significance.png"), "\n")
+#2. 运行脚本
+Rscript scripts/05b_plot_host_family_alpha_with_significance.R
+#3. 输出文件
+#生成的新图在这里：
+#/mnt/d/ITS_SH_pipeline/globalfungi_style_test/results/chapter3_alpha_diversity/Fig3_6_host_family_alpha_diversity_boxplot_with_Tukey_significance.pdf
+#/mnt/d/ITS_SH_pipeline/globalfungi_style_test/results/chapter3_alpha_diversity/Fig3_6_host_family_alpha_diversity_boxplot_with_Tukey_significance.png
+#同时会输出一个显著性标注表：
+#/mnt/d/ITS_SH_pipeline/globalfungi_style_test/results/chapter3_alpha_diversity/Fig3_6_host_family_alpha_significance_annotations.csv
+
+#建议主图放 Shannon 和 Simpson 两张，ACE 和 Chao1 放补充图或附图；表3-1 保留全部四个指标。
+#因为 Shannon/Simpson 更能体现多样性和均匀度，ACE/Chao1 更偏丰富度估计，四个都放正文主图可能信息重复。
+#在每张单独的箱线图右上角标 整体 ANOVA 的 P 值，例如：ANOVA P < 0.001
+#不要把所有 TukeyHSD 两两比较 P 值都标在图上，不然又会非常乱。两两比较 P 值放在表3-1里即可。
+#把刚才的单图脚本覆盖成下面这版。
+cd /mnt/d/ITS_SH_pipeline
+
+cat > scripts/05c_plot_host_family_alpha_separate.R <<'EOF'
+# ============================================================
+# Plot host_family alpha diversity as separate figures
+# Add overall ANOVA P value to each plot
+# Metrics: ACE, Chao1, Shannon, Simpson
+# Pairwise TukeyHSD results are kept in Table 3-1
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+})
+
+base_dir <- "/mnt/d/ITS_SH_pipeline/globalfungi_style_test"
+
+out_dir <- file.path(
+  base_dir,
+  "results/chapter3_alpha_diversity"
+)
+
+alpha_file <- file.path(
+  out_dir,
+  "alpha_diversity_ACE_Chao1_Shannon_Simpson.csv"
+)
+
+anova_file <- file.path(
+  out_dir,
+  "Table3_1_host_family_alpha_ANOVA.csv"
+)
+
+alpha_df <- read.csv(
+  alpha_file,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+anova_df <- read.csv(
+  anova_file,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+metrics <- c("ACE", "Chao1", "Shannon", "Simpson")
+
+family_order <- alpha_df %>%
+  count(host_family, sort = TRUE) %>%
+  pull(host_family)
+
+alpha_df <- alpha_df %>%
+  mutate(
+    host_family = factor(host_family, levels = family_order)
+  )
+
+format_p <- function(p) {
+  if (is.na(p)) {
+    return("ANOVA P = NA")
+  } else if (p < 0.001) {
+    return("ANOVA P < 0.001")
+  } else {
+    return(paste0("ANOVA P = ", signif(p, 3)))
+  }
+}
+
+plot_one_metric <- function(metric_name) {
+  dat <- alpha_df %>%
+    select(host_family, value = all_of(metric_name)) %>%
+    filter(!is.na(value), !is.na(host_family))
+
+  y_max <- max(dat$value, na.rm = TRUE)
+  y_min <- min(dat$value, na.rm = TRUE)
+  y_range <- y_max - y_min
+
+  if (y_range == 0) {
+    y_upper <- y_max * 1.1 + 1
+  } else {
+    y_upper <- y_max + y_range * 0.18
+  }
+
+  p_value <- anova_df %>%
+    filter(metric == metric_name) %>%
+    pull(P_value)
+
+  p_label <- format_p(p_value[1])
+
+  p <- ggplot(dat, aes(x = host_family, y = value, fill = host_family)) +
+    geom_boxplot(
+      width = 0.65,
+      outlier.shape = NA,
+      linewidth = 0.6
+    ) +
+    annotate(
+      "text",
+      x = length(family_order),
+      y = y_upper * 0.96,
+      label = p_label,
+      hjust = 1,
+      vjust = 1,
+      size = 4.5
+    ) +
+    scale_y_continuous(
+      limits = c(0, y_upper),
+      expand = expansion(mult = c(0, 0.02))
+    ) +
+    labs(
+      x = "Host family",
+      y = metric_name
+    ) +
+    theme_classic(base_size = 14) +
+    theme(
+      axis.text.x = element_text(angle = 35, hjust = 1, vjust = 1),
+      axis.title.x = element_text(size = 14),
+      axis.title.y = element_text(size = 15),
+      legend.position = "none"
+    )
+
+  ggsave(
+    file.path(out_dir, paste0("Fig3_6_host_family_alpha_", metric_name, "_boxplot_ANOVA_P.pdf")),
+    p,
+    width = 6.5,
+    height = 5
+  )
+
+  ggsave(
+    file.path(out_dir, paste0("Fig3_6_host_family_alpha_", metric_name, "_boxplot_ANOVA_P.png")),
+    p,
+    width = 6.5,
+    height = 5,
+    dpi = 300
+  )
+}
+
+for (m in metrics) {
+  plot_one_metric(m)
+}
+
+cat("\nDone!\n")
+cat("Output directory:\n", out_dir, "\n")
+cat("Generated separate host_family alpha diversity plots with ANOVA P values.\n")
+EOF
+#运行：
+Rscript scripts/05c_plot_host_family_alpha_separate.R
+#新图会生成：
+#Fig3_6_host_family_alpha_ACE_boxplot_ANOVA_P.pdf
+#Fig3_6_host_family_alpha_Chao1_boxplot_ANOVA_P.pdf
+#Fig3_6_host_family_alpha_Shannon_boxplot_ANOVA_P.pdf
+#Fig3_6_host_family_alpha_Simpson_boxplot_ANOVA_P.pdf
+#以及对应的 PNG。
+#直接把之前单独出图脚本覆盖成显示离群点 + 标整体 ANOVA P 值这一版。
+cd /mnt/d/ITS_SH_pipeline
+
+cat > scripts/05c_plot_host_family_alpha_separate.R <<'EOF'
+# ============================================================
+# Plot host_family alpha diversity as separate figures
+# Show outliers and add overall ANOVA P value
+# Metrics: ACE, Chao1, Shannon, Simpson
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+})
+
+base_dir <- "/mnt/d/ITS_SH_pipeline/globalfungi_style_test"
+
+out_dir <- file.path(
+  base_dir,
+  "results/chapter3_alpha_diversity"
+)
+
+alpha_file <- file.path(
+  out_dir,
+  "alpha_diversity_ACE_Chao1_Shannon_Simpson.csv"
+)
+
+anova_file <- file.path(
+  out_dir,
+  "Table3_1_host_family_alpha_ANOVA.csv"
+)
+
+alpha_df <- read.csv(
+  alpha_file,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+anova_df <- read.csv(
+  anova_file,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+metrics <- c("ACE", "Chao1", "Shannon", "Simpson")
+
+family_order <- alpha_df %>%
+  count(host_family, sort = TRUE) %>%
+  pull(host_family)
+
+alpha_df <- alpha_df %>%
+  mutate(
+    host_family = factor(host_family, levels = family_order)
+  )
+
+format_p <- function(p) {
+  if (is.na(p)) {
+    return("ANOVA P = NA")
+  } else if (p < 0.001) {
+    return("ANOVA P < 0.001")
+  } else {
+    return(paste0("ANOVA P = ", signif(p, 3)))
+  }
+}
+
+plot_one_metric <- function(metric_name) {
+  dat <- alpha_df %>%
+    select(host_family, value = all_of(metric_name)) %>%
+    filter(!is.na(value), !is.na(host_family))
+
+  y_max <- max(dat$value, na.rm = TRUE)
+  y_min <- min(dat$value, na.rm = TRUE)
+  y_range <- y_max - y_min
+
+  if (y_range == 0) {
+    y_upper <- y_max * 1.1 + 1
+  } else {
+    y_upper <- y_max + y_range * 0.12
+  }
+
+  p_value <- anova_df %>%
+    filter(metric == metric_name) %>%
+    pull(P_value)
+
+  p_label <- format_p(p_value[1])
+
+  p <- ggplot(dat, aes(x = host_family, y = value, fill = host_family)) +
+    geom_boxplot(
+      width = 0.65,
+      outlier.shape = 16,
+      outlier.size = 0.8,
+      outlier.alpha = 0.5,
+      linewidth = 0.6
+    ) +
+    annotate(
+      "text",
+      x = length(family_order),
+      y = y_upper * 0.96,
+      label = p_label,
+      hjust = 1,
+      vjust = 1,
+      size = 4.5
+    ) +
+    scale_y_continuous(
+      limits = c(0, y_upper),
+      expand = expansion(mult = c(0, 0.02))
+    ) +
+    labs(
+      x = "Host family",
+      y = metric_name
+    ) +
+    theme_classic(base_size = 14) +
+    theme(
+      axis.text.x = element_text(angle = 35, hjust = 1, vjust = 1),
+      axis.title.x = element_text(size = 14),
+      axis.title.y = element_text(size = 15),
+      legend.position = "none"
+    )
+
+  ggsave(
+    file.path(out_dir, paste0("Fig3_6_host_family_alpha_", metric_name, "_boxplot_outliers_ANOVA_P.pdf")),
+    p,
+    width = 6.5,
+    height = 5
+  )
+
+  ggsave(
+    file.path(out_dir, paste0("Fig3_6_host_family_alpha_", metric_name, "_boxplot_outliers_ANOVA_P.png")),
+    p,
+    width = 6.5,
+    height = 5,
+    dpi = 300
+  )
+}
+
+for (m in metrics) {
+  plot_one_metric(m)
+}
+
+cat("\nDone!\n")
+cat("Output directory:\n", out_dir, "\n")
+cat("Generated separate host_family alpha diversity plots with outliers and ANOVA P values.\n")
+EOF
+#然后运行：
+Rscript scripts/05c_plot_host_family_alpha_separate.R
+#新图会生成在：
+#/mnt/d/ITS_SH_pipeline/globalfungi_style_test/results/chapter3_alpha_diversity
+#文件名是：
+#Fig3_6_host_family_alpha_ACE_boxplot_outliers_ANOVA_P.png
+#Fig3_6_host_family_alpha_Chao1_boxplot_outliers_ANOVA_P.png
+#Fig3_6_host_family_alpha_Shannon_boxplot_outliers_ANOVA_P.png
+#Fig3_6_host_family_alpha_Simpson_boxplot_outliers_ANOVA_P.png
+#以及对应的 .pdf。
