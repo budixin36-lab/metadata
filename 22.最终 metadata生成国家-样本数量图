@@ -1,0 +1,281 @@
+#现在应该用这个最终 metadata 文件重新画：
+#/mnt/d/ITS_SH_pipeline/globalfungi_style_test/metadata/metadata_valid_globalfungi_SH_nozero.csv
+#下面这版 R 代码会重新生成：
+#/mnt/d/ITS_SH_pipeline/globalfungi_style_test/results/country_sample_map_final_SH/country_sample_counts_final_SH.csv
+#/mnt/d/ITS_SH_pipeline/globalfungi_style_test/results/country_sample_map_final_SH/country_sample_map_final_SH.png
+#/mnt/d/ITS_SH_pipeline/globalfungi_style_test/results/country_sample_map_final_SH/country_sample_map_final_SH.pdf
+#1. 在 WSL 里新建 R 脚本
+cd /mnt/d/ITS_SH_pipeline
+
+mkdir -p globalfungi_style_test/scripts
+
+nano globalfungi_style_test/scripts/plot_country_sample_map_final_SH.R
+#粘贴：
+# plot_country_sample_map_final_SH.R
+# 根据最终 SH 表中保留的样本重新绘制国家-样本数量分布图
+
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(ggrepel)
+
+# =========================
+# 1. 输入和输出路径
+# =========================
+
+metadata_file <- "/mnt/d/ITS_SH_pipeline/globalfungi_style_test/metadata/metadata_valid_globalfungi_SH_nozero.csv"
+
+out_dir <- "/mnt/d/ITS_SH_pipeline/globalfungi_style_test/results/country_sample_map_final_SH"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+out_counts <- file.path(out_dir, "country_sample_counts_final_SH.csv")
+out_png <- file.path(out_dir, "country_sample_map_final_SH.png")
+out_pdf <- file.path(out_dir, "country_sample_map_final_SH.pdf")
+
+# =========================
+# 2. 读取最终 metadata
+# =========================
+
+df <- read_csv(metadata_file, show_col_types = FALSE)
+
+# 检查 country 列
+if (!"country" %in% colnames(df)) {
+  stop("metadata 中没有 country 列，请检查列名。")
+}
+
+# =========================
+# 3. 统计每个国家样本数
+# =========================
+
+country_counts <- df %>%
+  mutate(country = trimws(as.character(country))) %>%
+  filter(!is.na(country), country != "", country != "not_recorded", country != "not reported") %>%
+  count(country, name = "number_of_samples") %>%
+  arrange(desc(number_of_samples))
+
+write_csv(country_counts, out_counts)
+
+cat("Country counts:\n")
+print(country_counts)
+
+cat("\nTotal samples used in country map:", sum(country_counts$number_of_samples), "\n")
+cat("Number of countries:", nrow(country_counts), "\n")
+
+# =========================
+# 4. 国家名称匹配表
+#    左边是你 metadata 里的 country 名称
+#    右边是 rnaturalearth 世界地图中的国家名
+# =========================
+
+country_name_map <- tibble::tribble(
+  ~country, ~map_name,
+  "China", "China",
+  "Spain", "Spain",
+  "United Kingdom", "United Kingdom",
+  "Finland", "Finland",
+  "United States", "United States of America",
+  "USA", "United States of America",
+  "Canada", "Canada",
+  "South Africa", "South Africa",
+  "Netherlands", "Netherlands",
+  "Italy", "Italy",
+  "Germany", "Germany",
+  "Hungary", "Hungary",
+  "Brazil", "Brazil",
+  "Argentina", "Argentina",
+  "Denmark", "Denmark"
+)
+
+country_counts2 <- country_counts %>%
+  left_join(country_name_map, by = "country") %>%
+  mutate(map_name = ifelse(is.na(map_name), country, map_name))
+
+# =========================
+# 5. 读取世界地图
+# =========================
+
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+# 查看地图国家名列：
+# names(world)
+# unique(world$name)
+
+# 只提取参与作图国家的几何中心
+plot_data <- world %>%
+  select(name, geometry) %>%
+  right_join(country_counts2, by = c("name" = "map_name"))
+
+# 如果有国家没匹配上，提醒
+unmatched <- plot_data %>%
+  st_drop_geometry() %>%
+  filter(is.na(name))
+
+if (nrow(unmatched) > 0) {
+  cat("\nWarning: these countries were not matched to map names:\n")
+  print(unmatched)
+}
+
+# =========================
+# 6. 计算标签位置
+# =========================
+
+# 为了避免 st_point_on_surface 的经纬度警告，先转 Robinson 投影
+world_robin <- st_transform(world, "+proj=robin")
+plot_data_robin <- st_transform(plot_data, "+proj=robin")
+
+plot_points <- plot_data_robin %>%
+  mutate(point = st_point_on_surface(geometry)) %>%
+  st_set_geometry("point")
+
+coords <- st_coordinates(plot_points)
+
+plot_points <- plot_points %>%
+  mutate(
+    x = coords[, 1],
+    y = coords[, 2],
+    label = paste0(country, ": ", number_of_samples)
+  )
+
+# =========================
+# 7. 手动微调个别国家标签位置
+#    这一步是为了让欧洲标签不重叠
+#    如果你觉得某些标签位置不好，可以改 nudge_x / nudge_y
+# =========================
+
+plot_points <- plot_points %>%
+  mutate(
+    nudge_x = case_when(
+      country == "China" ~ 900000,
+      country == "Spain" ~ -800000,
+      country == "United Kingdom" ~ -900000,
+      country == "Netherlands" ~ -900000,
+      country == "Germany" ~ 900000,
+      country == "Hungary" ~ 900000,
+      country == "Italy" ~ 500000,
+      country == "Finland" ~ 700000,
+      country == "Denmark" ~ 200000,
+      country == "Canada" ~ 700000,
+      country == "United States" ~ 700000,
+      country == "South Africa" ~ 800000,
+      country == "Brazil" ~ 800000,
+      country == "Argentina" ~ 700000,
+      TRUE ~ 300000
+    ),
+    nudge_y = case_when(
+      country == "China" ~ -350000,
+      country == "Spain" ~ -300000,
+      country == "United Kingdom" ~ 350000,
+      country == "Netherlands" ~ 450000,
+      country == "Germany" ~ 180000,
+      country == "Hungary" ~ -200000,
+      country == "Italy" ~ -300000,
+      country == "Finland" ~ 350000,
+      country == "Denmark" ~ 450000,
+      country == "Canada" ~ 350000,
+      country == "United States" ~ 350000,
+      country == "South Africa" ~ 250000,
+      country == "Brazil" ~ 250000,
+      country == "Argentina" ~ 250000,
+      TRUE ~ 200000
+    )
+  )
+
+# =========================
+# 8. 作图
+# =========================
+
+p <- ggplot() +
+  geom_sf(
+    data = world_robin,
+    fill = "grey85",
+    color = "white",
+    linewidth = 0.25
+  ) +
+  geom_point(
+    data = plot_points,
+    aes(x = x, y = y, size = number_of_samples),
+    shape = 21,
+    fill = "#F6E27F",
+    color = "grey45",
+    alpha = 0.95,
+    stroke = 0.4
+  ) +
+  geom_label_repel(
+    data = plot_points,
+    aes(x = x, y = y, label = label),
+    size = 4,
+    family = "serif",
+    label.size = 0.25,
+    fill = "white",
+    color = "black",
+    min.segment.length = 0,
+    segment.color = "grey35",
+    segment.size = 0.25,
+    box.padding = 0.25,
+    point.padding = 0.2,
+    max.overlaps = Inf,
+    nudge_x = plot_points$nudge_x,
+    nudge_y = plot_points$nudge_y
+  ) +
+  scale_size_continuous(
+    name = "Number of samples",
+    range = c(1.5, 18),
+    breaks = c(500, 1000, 1500)
+  ) +
+  guides(
+    size = guide_legend(
+      title.position = "top",
+      label.position = "right",
+      override.aes = list(fill = "#F6E27F", color = "grey45")
+    )
+  ) +
+  coord_sf(
+    crs = "+proj=robin",
+    xlim = c(-17000000, 17000000),
+    ylim = c(-6500000, 8500000),
+    expand = FALSE
+  ) +
+  theme_bw(base_family = "serif") +
+  theme(
+    panel.grid = element_blank(),
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = c(0.12, 0.24),
+    legend.background = element_rect(fill = "white", color = NA),
+    legend.key = element_rect(fill = "white", color = NA),
+    legend.title = element_text(size = 13),
+    legend.text = element_text(size = 11),
+    plot.margin = margin(5, 5, 5, 5)
+  )
+
+# =========================
+# 9. 保存图片
+# =========================
+
+ggsave(
+  filename = out_png,
+  plot = p,
+  width = 12,
+  height = 6,
+  dpi = 600,
+  bg = "white"
+)
+
+ggsave(
+  filename = out_pdf,
+  plot = p,
+  width = 12,
+  height = 6,
+  bg = "white"
+)
+
+cat("\nDone!\n")
+cat("Country counts saved to: ", out_counts, "\n", sep = "")
+cat("Map PNG saved to: ", out_png, "\n", sep = "")
+cat("Map PDF saved to: ", out_pdf, "\n", sep = "")
+#2. 运行脚本
+Rscript globalfungi_style_test/scripts/plot_country_sample_map_final_SH.R
