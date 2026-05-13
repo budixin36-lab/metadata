@@ -279,3 +279,14 @@ cat("Map PNG saved to: ", out_png, "\n", sep = "")
 cat("Map PDF saved to: ", out_pdf, "\n", sep = "")
 #2. 运行脚本
 Rscript globalfungi_style_test/scripts/plot_country_sample_map_final_SH.R
+#sf 依赖 KernSmooth，但你当前 R 环境里没有。
+#在 WSL 终端运行：
+R
+#进入 R 后安装：
+install.packages("KernSmooth")
+#安装完退出 R：
+q()
+#然后重新运行：
+Rscript globalfungi_style_test/scripts/plot_country_sample_map_final_SH.R
+#如果后面又提示缺其他包，也用同样方法安装。例如：
+install.packages(c("KernSmooth", "classInt", "units", "s2"))
