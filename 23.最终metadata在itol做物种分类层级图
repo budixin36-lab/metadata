@@ -1,0 +1,997 @@
+#你这个错误主要有两个问题：
+#第一，itol_samples_text_final_SH_v2.txt 格式不完整。
+#iTOL 的 DATASET_TEXT 不能只写：sp_Bos_taurus    867
+#它还需要颜色、字体样式、字号等字段，否则就会出现你截图里的：
+#Invalid color definition 'undefined'
+#Invalid font style 'undefined'
+#第二，tree 其实有目、科、属、种的内部节点，但 iTOL 默认不显示内部节点标签，所以你看起来像是没有从目开始。
+#要让目、科、属显示在树上，需要额外上传一个 internal node labels / branch labels 文件，或者用 iTOL 设置显示 internal labels。最稳的是我们直接生成一个 itol_internal_labels_final_SH_v3.txt。
+#你直接用下面这个修正版脚本重新生成。
+#1. 新建 v3 脚本
+cd /mnt/d/ITS_SH_pipeline
+
+nano globalfungi_style_test/scripts/make_itol_host_taxonomic_tree_final_SH_v3.R
+#粘贴完整代码：
+# make_itol_host_taxonomic_tree_final_SH_v3.R
+# 生成 iTOL 宿主分类层级树：目 -> 科 -> 属 -> 种
+# tree 中用安全 ID；通过 labels 文件显示正常物种名
+# 额外生成 internal labels 文件，用于显示目、科、属节点
+# 修复 DATASET_TEXT 的 undefined color / font style 错误
+
+library(readr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(RColorBrewer)
+
+metadata_file <- "/mnt/d/ITS_SH_pipeline/globalfungi_style_test/metadata/metadata_valid_globalfungi_SH_nozero.csv"
+
+out_dir <- "/mnt/d/ITS_SH_pipeline/globalfungi_style_test/results/itol_final_SH_v3"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+out_tree <- file.path(out_dir, "host_taxonomic_tree_final_SH_v3.nwk")
+out_labels <- file.path(out_dir, "itol_labels_final_SH_v3.txt")
+out_internal_labels <- file.path(out_dir, "itol_internal_labels_final_SH_v3.txt")
+out_samples_text <- file.path(out_dir, "itol_samples_text_final_SH_v3.txt")
+out_status_pie <- file.path(out_dir, "itol_status_pie_final_SH_v3.txt")
+out_country_pie <- file.path(out_dir, "itol_country_pie_final_SH_v3.txt")
+
+out_species_summary <- file.path(out_dir, "host_species_summary_final_SH_v3.csv")
+out_family_summary <- file.path(out_dir, "host_family_summary_final_SH_v3.csv")
+out_order_summary <- file.path(out_dir, "host_order_summary_final_SH_v3.csv")
+
+df <- read_csv(metadata_file, show_col_types = FALSE)
+
+required_cols <- c("host_order", "host_family", "host_genus", "host_species", "status", "country")
+missing_cols <- setdiff(required_cols, colnames(df))
+if (length(missing_cols) > 0) {
+  stop("metadata 缺少这些列: ", paste(missing_cols, collapse = ", "))
+}
+
+clean_value <- function(x) {
+  x <- trimws(as.character(x))
+  x[is.na(x) | x == "" | x %in% c("NA", "N/A", "missing", "not_recorded", "not reported")] <- "unknown"
+  x
+}
+
+safe_id <- function(x) {
+  x <- trimws(as.character(x))
+  x <- gsub("'", "", x)
+  x <- gsub("\\s+", "_", x)
+  x <- gsub("[,;()\\[\\]:]", "_", x)
+  x <- gsub("[^A-Za-z0-9_.-]", "_", x)
+  x
+}
+
+df2 <- df %>%
+  mutate(
+    host_order = clean_value(host_order),
+    host_family = clean_value(host_family),
+    host_genus = clean_value(host_genus),
+    host_species = clean_value(host_species),
+    status = clean_value(status),
+    country = clean_value(country)
+  ) %>%
+  filter(
+    host_order != "unknown",
+    host_family != "unknown",
+    host_genus != "unknown",
+    host_species != "unknown"
+  )
+
+species_summary <- df2 %>%
+  group_by(host_order, host_family, host_genus, host_species) %>%
+  summarise(number_of_samples = n(), .groups = "drop") %>%
+  arrange(host_order, host_family, host_genus, host_species) %>%
+  mutate(
+    species_id = paste0("sp_", safe_id(host_species)),
+    genus_id = paste0("genus_", safe_id(host_genus)),
+    family_id = paste0("family_", safe_id(host_family)),
+    order_id = paste0("order_", safe_id(host_order))
+  )
+
+family_summary <- species_summary %>%
+  group_by(host_order, host_family, family_id) %>%
+  summarise(number_of_samples = sum(number_of_samples), .groups = "drop") %>%
+  arrange(host_order, host_family)
+
+order_summary <- species_summary %>%
+  group_by(host_order, order_id) %>%
+  summarise(number_of_samples = sum(number_of_samples), .groups = "drop") %>%
+  arrange(host_order)
+
+write_csv(species_summary, out_species_summary)
+write_csv(family_summary, out_family_summary)
+write_csv(order_summary, out_order_summary)
+
+cat("Final samples:", nrow(df2), "\n")
+cat("Host orders:", n_distinct(species_summary$host_order), "\n")
+cat("Host families:", n_distinct(species_summary$host_family), "\n")
+cat("Host genera:", n_distinct(species_summary$host_genus), "\n")
+cat("Host species:", n_distinct(species_summary$host_species), "\n")
+
+# =========================
+# 生成 Newick：目 -> 科 -> 属 -> 种
+# =========================
+
+make_genus_subtree <- function(d_genus) {
+  genus_id <- unique(d_genus$genus_id)
+  species_ids <- d_genus %>%
+    arrange(host_species) %>%
+    pull(species_id) %>%
+    unique()
+  paste0("(", paste(species_ids, collapse = ","), ")", genus_id)
+}
+
+make_family_subtree <- function(d_family) {
+  family_id <- unique(d_family$family_id)
+  genus_list <- d_family %>%
+    distinct(host_genus, genus_id) %>%
+    arrange(host_genus)
+
+  genus_subtrees <- c()
+
+  for (i in seq_len(nrow(genus_list))) {
+    g <- genus_list$host_genus[i]
+    d_g <- d_family %>% filter(host_genus == g)
+    genus_subtrees <- c(genus_subtrees, make_genus_subtree(d_g))
+  }
+
+  paste0("(", paste(genus_subtrees, collapse = ","), ")", family_id)
+}
+
+make_order_subtree <- function(d_order) {
+  order_id <- unique(d_order$order_id)
+  family_list <- d_order %>%
+    distinct(host_family, family_id) %>%
+    arrange(host_family)
+
+  family_subtrees <- c()
+
+  for (i in seq_len(nrow(family_list))) {
+    f <- family_list$host_family[i]
+    d_f <- d_order %>% filter(host_family == f)
+    family_subtrees <- c(family_subtrees, make_family_subtree(d_f))
+  }
+
+  paste0("(", paste(family_subtrees, collapse = ","), ")", order_id)
+}
+
+order_list <- species_summary %>%
+  distinct(host_order, order_id) %>%
+  arrange(host_order)
+
+order_subtrees <- c()
+
+for (i in seq_len(nrow(order_list))) {
+  ord <- order_list$host_order[i]
+  d_o <- species_summary %>% filter(host_order == ord)
+  order_subtrees <- c(order_subtrees, make_order_subtree(d_o))
+}
+
+newick <- paste0("(", paste(order_subtrees, collapse = ","), ")root;")
+writeLines(newick, out_tree)
+
+# =========================
+# Labels：让叶节点显示 Bos taurus 而不是 sp_Bos_taurus
+# =========================
+
+label_df_species <- species_summary %>%
+  distinct(id = species_id, label = host_species)
+
+label_df_genus <- species_summary %>%
+  distinct(id = genus_id, label = host_genus)
+
+label_df_family <- family_summary %>%
+  mutate(label = paste0(host_family, " n=", number_of_samples)) %>%
+  distinct(id = family_id, label)
+
+label_df_order <- order_summary %>%
+  distinct(id = order_id, label = host_order)
+
+label_df <- bind_rows(
+  tibble(id = "root", label = ""),
+  label_df_order,
+  label_df_family,
+  label_df_genus,
+  label_df_species
+) %>%
+  distinct(id, .keep_all = TRUE)
+
+labels_lines <- c(
+  "LABELS",
+  "SEPARATOR TAB",
+  "DATA",
+  paste(label_df$id, label_df$label, sep = "\t")
+)
+
+writeLines(labels_lines, out_labels)
+
+# =========================
+# Internal node labels：让目、科、属也显示出来
+# =========================
+
+internal_df <- bind_rows(
+  order_summary %>%
+    transmute(id = order_id, label = host_order),
+  family_summary %>%
+    transmute(id = family_id, label = paste0(host_family, " n=", number_of_samples)),
+  species_summary %>%
+    distinct(id = genus_id, label = host_genus)
+) %>%
+  distinct(id, .keep_all = TRUE)
+
+internal_lines <- c(
+  "DATASET_TEXT",
+  "SEPARATOR TAB",
+  "DATASET_LABEL\tTaxonomic labels",
+  "COLOR\t#000000",
+  "DATA",
+  paste(
+    internal_df$id,
+    internal_df$label,
+    "0",
+    "#000000",
+    "normal",
+    "1",
+    "0",
+    sep = "\t"
+  )
+)
+
+writeLines(internal_lines, out_internal_labels)
+
+# =========================
+# Samples text annotation
+# 修复格式：ID, text, position, color, style, size, rotation
+# =========================
+
+samples_lines <- c(
+  "DATASET_TEXT",
+  "SEPARATOR TAB",
+  "DATASET_LABEL\tSamples",
+  "COLOR\t#000000",
+  "DATA",
+  paste(
+    species_summary$species_id,
+    species_summary$number_of_samples,
+    "1",
+    "#000000",
+    "normal",
+    "1",
+    "0",
+    sep = "\t"
+  )
+)
+
+writeLines(samples_lines, out_samples_text)
+
+# =========================
+# Status pie
+# =========================
+
+status_levels <- c("Domesticated", "Captive", "Wild")
+status_colors <- c("#14BFC6", "#F26B6B", "#FDB45C")
+
+df_status <- df2 %>%
+  mutate(
+    species_id = paste0("sp_", safe_id(host_species)),
+    status2 = case_when(
+      tolower(status) == "domesticated" ~ "Domesticated",
+      tolower(status) == "captive" ~ "Captive",
+      tolower(status) == "wild" ~ "Wild",
+      TRUE ~ "Unknown"
+    )
+  )
+
+if ("Unknown" %in% df_status$status2) {
+  status_levels <- c(status_levels, "Unknown")
+  status_colors <- c(status_colors, "#BDBDBD")
+}
+
+status_wide <- df_status %>%
+  count(species_id, status2, name = "n") %>%
+  complete(species_id, status2 = status_levels, fill = list(n = 0)) %>%
+  pivot_wider(names_from = status2, values_from = n) %>%
+  arrange(species_id)
+
+status_data_lines <- apply(status_wide, 1, function(x) {
+  paste(c(x[["species_id"]], as.numeric(x[status_levels])), collapse = "\t")
+})
+
+status_lines <- c(
+  "DATASET_PIECHART",
+  "SEPARATOR TAB",
+  "DATASET_LABEL\tStatus",
+  "COLOR\t#000000",
+  paste0("FIELD_LABELS\t", paste(status_levels, collapse = "\t")),
+  paste0("FIELD_COLORS\t", paste(status_colors, collapse = "\t")),
+  "MAXIMUM_SIZE\t30",
+  "DATA",
+  status_data_lines
+)
+
+writeLines(status_lines, out_status_pie)
+
+# =========================
+# Country pie
+# =========================
+
+df_country <- df2 %>%
+  mutate(species_id = paste0("sp_", safe_id(host_species)))
+
+country_levels <- df_country %>%
+  count(country, name = "n") %>%
+  arrange(desc(n), country) %>%
+  pull(country)
+
+if (length(country_levels) <= 12) {
+  country_colors <- brewer.pal(max(3, length(country_levels)), "Set3")[seq_along(country_levels)]
+} else {
+  country_colors <- colorRampPalette(brewer.pal(12, "Set3"))(length(country_levels))
+}
+
+country_wide <- df_country %>%
+  count(species_id, country, name = "n") %>%
+  complete(species_id, country = country_levels, fill = list(n = 0)) %>%
+  pivot_wider(names_from = country, values_from = n) %>%
+  arrange(species_id)
+
+country_data_lines <- apply(country_wide, 1, function(x) {
+  paste(c(x[["species_id"]], as.numeric(x[country_levels])), collapse = "\t")
+})
+
+country_lines <- c(
+  "DATASET_PIECHART",
+  "SEPARATOR TAB",
+  "DATASET_LABEL\tCountry",
+  "COLOR\t#000000",
+  paste0("FIELD_LABELS\t", paste(country_levels, collapse = "\t")),
+  paste0("FIELD_COLORS\t", paste(country_colors, collapse = "\t")),
+  "MAXIMUM_SIZE\t30",
+  "DATA",
+  country_data_lines
+)
+
+writeLines(country_lines, out_country_pie)
+
+cat("\nDone!\n")
+cat("Output directory:\n", out_dir, "\n\n")
+cat("Upload to iTOL in this order:\n")
+cat("1. Tree: ", out_tree, "\n", sep = "")
+cat("2. Labels: ", out_labels, "\n", sep = "")
+cat("3. Internal labels: ", out_internal_labels, "\n", sep = "")
+cat("4. Samples: ", out_samples_text, "\n", sep = "")
+cat("5. Status: ", out_status_pie, "\n", sep = "")
+cat("6. Country: ", out_country_pie, "\n", sep = "")
+#2. 运行
+Rscript globalfungi_style_test/scripts/make_itol_host_taxonomic_tree_final_SH_v3.R
+#3. 上传顺序
+#打开这个文件夹：
+#D:\ITS_SH_pipeline\globalfungi_style_test\results\itol_final_SH_v3
+#上传顺序：
+#1. host_taxonomic_tree_final_SH_v3.nwk
+#2. itol_labels_final_SH_v3.txt
+#3. itol_internal_labels_final_SH_v3.txt
+#4. itol_samples_text_final_SH_v3.txt
+#5. itol_status_pie_final_SH_v3.txt
+#6. itol_country_pie_final_SH_v3.txt
+#这次有两个问题：
+#status pie 的文件格式还是不够稳定，iTOL 解析时认为每一行字段数和 FIELD_LABELS 对不上。
+#属名不应该作为分支文字显示，树结构里可以保留“属”这一层，但图上只显示：目、科、种名、Samples、Status、Country。
+#你现在不需要重做 tree，只要重新生成 internal labels、samples、status pie、country pie 这几个 annotation 文件即可。下面给你一个修正版脚本：不显示属名，并修复 pie 文件格式。
+#1. 新建修正版 annotation 脚本
+cd /mnt/d/ITS_SH_pipeline
+
+nano globalfungi_style_test/scripts/make_itol_annotations_final_SH_v4.R
+#粘贴：
+# make_itol_annotations_final_SH_v4.R
+# 修复 iTOL annotation files:
+# 1. 不显示属名
+# 2. 修复 DATASET_PIECHART 字段数不匹配问题
+# 3. 继续使用 v3 tree 里的 safe IDs
+
+library(readr)
+library(dplyr)
+library(tidyr)
+library(RColorBrewer)
+
+metadata_file <- "/mnt/d/ITS_SH_pipeline/globalfungi_style_test/metadata/metadata_valid_globalfungi_SH_nozero.csv"
+
+out_dir <- "/mnt/d/ITS_SH_pipeline/globalfungi_style_test/results/itol_final_SH_v4"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+out_labels <- file.path(out_dir, "itol_labels_final_SH_v4.txt")
+out_internal_labels <- file.path(out_dir, "itol_internal_labels_no_genus_final_SH_v4.txt")
+out_samples_text <- file.path(out_dir, "itol_samples_text_final_SH_v4.txt")
+out_status_pie <- file.path(out_dir, "itol_status_pie_final_SH_v4.txt")
+out_country_pie <- file.path(out_dir, "itol_country_pie_final_SH_v4.txt")
+
+safe_id <- function(x) {
+  x <- trimws(as.character(x))
+  x <- gsub("'", "", x)
+  x <- gsub("\\s+", "_", x)
+  x <- gsub("[,;()\\[\\]:]", "_", x)
+  x <- gsub("[^A-Za-z0-9_.-]", "_", x)
+  x
+}
+
+clean_value <- function(x) {
+  x <- trimws(as.character(x))
+  x[is.na(x) | x == "" | x %in% c("NA", "N/A", "missing", "not_recorded", "not reported")] <- "unknown"
+  x
+}
+
+df <- read_csv(metadata_file, show_col_types = FALSE)
+
+df2 <- df %>%
+  mutate(
+    host_order = clean_value(host_order),
+    host_family = clean_value(host_family),
+    host_genus = clean_value(host_genus),
+    host_species = clean_value(host_species),
+    status = clean_value(status),
+    country = clean_value(country)
+  ) %>%
+  filter(
+    host_order != "unknown",
+    host_family != "unknown",
+    host_genus != "unknown",
+    host_species != "unknown"
+  ) %>%
+  mutate(
+    species_id = paste0("sp_", safe_id(host_species)),
+    genus_id = paste0("genus_", safe_id(host_genus)),
+    family_id = paste0("family_", safe_id(host_family)),
+    order_id = paste0("order_", safe_id(host_order))
+  )
+
+species_summary <- df2 %>%
+  group_by(host_order, host_family, host_genus, host_species, species_id, genus_id, family_id, order_id) %>%
+  summarise(number_of_samples = n(), .groups = "drop") %>%
+  arrange(host_order, host_family, host_genus, host_species)
+
+family_summary <- species_summary %>%
+  group_by(host_order, host_family, family_id) %>%
+  summarise(number_of_samples = sum(number_of_samples), .groups = "drop") %>%
+  arrange(host_order, host_family)
+
+order_summary <- species_summary %>%
+  group_by(host_order, order_id) %>%
+  summarise(number_of_samples = sum(number_of_samples), .groups = "drop") %>%
+  arrange(host_order)
+
+# =========================
+# 1. labels 文件：物种显示正常名；属节点标签设为空，避免显示属名
+# =========================
+
+label_df_species <- species_summary %>%
+  distinct(id = species_id, label = host_species)
+
+label_df_genus_blank <- species_summary %>%
+  distinct(id = genus_id) %>%
+  mutate(label = "")
+
+label_df_family <- family_summary %>%
+  mutate(label = paste0(host_family, " n=", number_of_samples)) %>%
+  distinct(id = family_id, label)
+
+label_df_order <- order_summary %>%
+  distinct(id = order_id, label = host_order)
+
+label_df <- bind_rows(
+  tibble(id = "root", label = ""),
+  label_df_order,
+  label_df_family,
+  label_df_genus_blank,
+  label_df_species
+) %>%
+  distinct(id, .keep_all = TRUE)
+
+labels_lines <- c(
+  "LABELS",
+  "SEPARATOR TAB",
+  "DATA",
+  paste(label_df$id, label_df$label, sep = "\t")
+)
+
+writeLines(labels_lines, out_labels)
+
+# =========================
+# 2. internal labels：只显示目和科，不显示属
+# =========================
+
+internal_df <- bind_rows(
+  order_summary %>%
+    transmute(id = order_id, label = host_order),
+  family_summary %>%
+    transmute(id = family_id, label = paste0(host_family, " n=", number_of_samples))
+) %>%
+  distinct(id, .keep_all = TRUE)
+
+internal_lines <- c(
+  "DATASET_TEXT",
+  "SEPARATOR TAB",
+  "DATASET_LABEL\tTaxonomic labels",
+  "COLOR\t#000000",
+  "DATA"
+)
+
+internal_data <- paste(
+  internal_df$id,
+  internal_df$label,
+  "0",
+  "#000000",
+  "normal",
+  "1",
+  "0",
+  sep = "\t"
+)
+
+writeLines(c(internal_lines, internal_data), out_internal_labels)
+
+# =========================
+# 3. samples text：ID, text, position, color, style, size, rotation
+# =========================
+
+samples_lines <- c(
+  "DATASET_TEXT",
+  "SEPARATOR TAB",
+  "DATASET_LABEL\tSamples",
+  "COLOR\t#000000",
+  "DATA"
+)
+
+samples_data <- paste(
+  species_summary$species_id,
+  species_summary$number_of_samples,
+  "1",
+  "#000000",
+  "normal",
+  "1",
+  "0",
+  sep = "\t"
+)
+
+writeLines(c(samples_lines, samples_data), out_samples_text)
+
+# =========================
+# 4. status pie：固定三类，保证每行字段数一致
+# =========================
+
+df_status <- df2 %>%
+  mutate(
+    status2 = case_when(
+      tolower(status) == "domesticated" ~ "Domesticated",
+      tolower(status) == "captive" ~ "Captive",
+      tolower(status) == "wild" ~ "Wild",
+      TRUE ~ "Unknown"
+    )
+  )
+
+status_levels <- c("Domesticated", "Captive", "Wild", "Unknown")
+status_colors <- c("#14BFC6", "#F26B6B", "#FDB45C", "#BDBDBD")
+
+status_wide <- df_status %>%
+  count(species_id, status2, name = "n") %>%
+  complete(species_id = unique(species_summary$species_id),
+           status2 = status_levels,
+           fill = list(n = 0)) %>%
+  pivot_wider(names_from = status2, values_from = n, values_fill = 0) %>%
+  arrange(species_id)
+
+# 确保列完整且顺序固定
+for (s in status_levels) {
+  if (!s %in% colnames(status_wide)) status_wide[[s]] <- 0
+}
+status_wide <- status_wide[, c("species_id", status_levels)]
+
+status_lines <- c(
+  "DATASET_PIECHART",
+  "SEPARATOR TAB",
+  "DATASET_LABEL\tStatus",
+  "COLOR\t#000000",
+  paste0("FIELD_LABELS\t", paste(status_levels, collapse = "\t")),
+  paste0("FIELD_COLORS\t", paste(status_colors, collapse = "\t")),
+  "MAXIMUM_SIZE\t30",
+  "DATA"
+)
+
+status_data <- apply(status_wide, 1, function(x) {
+  paste(c(x[["species_id"]], as.character(as.integer(as.numeric(x[status_levels])))), collapse = "\t")
+})
+
+writeLines(c(status_lines, status_data), out_status_pie)
+
+# =========================
+# 5. country pie：固定列顺序，保证每行字段数一致
+# =========================
+
+country_levels <- df2 %>%
+  count(country, name = "n") %>%
+  arrange(desc(n), country) %>%
+  pull(country)
+
+if (length(country_levels) <= 12) {
+  country_colors <- brewer.pal(max(3, length(country_levels)), "Set3")[seq_along(country_levels)]
+} else {
+  country_colors <- colorRampPalette(brewer.pal(12, "Set3"))(length(country_levels))
+}
+
+country_wide <- df2 %>%
+  count(species_id, country, name = "n") %>%
+  complete(species_id = unique(species_summary$species_id),
+           country = country_levels,
+           fill = list(n = 0)) %>%
+  pivot_wider(names_from = country, values_from = n, values_fill = 0) %>%
+  arrange(species_id)
+
+for (cc in country_levels) {
+  if (!cc %in% colnames(country_wide)) country_wide[[cc]] <- 0
+}
+country_wide <- country_wide[, c("species_id", country_levels)]
+
+country_lines <- c(
+  "DATASET_PIECHART",
+  "SEPARATOR TAB",
+  "DATASET_LABEL\tCountry",
+  "COLOR\t#000000",
+  paste0("FIELD_LABELS\t", paste(country_levels, collapse = "\t")),
+  paste0("FIELD_COLORS\t", paste(country_colors, collapse = "\t")),
+  "MAXIMUM_SIZE\t30",
+  "DATA"
+)
+
+country_data <- apply(country_wide, 1, function(x) {
+  paste(c(x[["species_id"]], as.character(as.integer(as.numeric(x[country_levels])))), collapse = "\t")
+})
+
+writeLines(c(country_lines, country_data), out_country_pie)
+
+cat("\nDone!\n")
+cat("Output directory:\n", out_dir, "\n\n")
+cat("Upload files:\n")
+cat("1. itol_labels_final_SH_v4.txt\n")
+cat("2. itol_internal_labels_no_genus_final_SH_v4.txt\n")
+cat("3. itol_samples_text_final_SH_v4.txt\n")
+cat("4. itol_status_pie_final_SH_v4.txt\n")
+cat("5. itol_country_pie_final_SH_v4.txt\n")
+#2. 运行脚本
+Rscript globalfungi_style_test/scripts/make_itol_annotations_final_SH_v4.R
+#3. 在 iTOL 里先删掉旧的 annotation
+#你现在左下角已经有：Taxonomic labels、Samples
+#先点每个 dataset 旁边的垃圾桶，删掉旧的：Taxonomic labels、Samples、Status、Country
+#然后重新上传 v4 的文件。
+#4. 上传顺序
+#树可以继续用你现在的 v3 tree：
+#host_taxonomic_tree_final_SH_v3.nwk
+#然后上传 v4 annotation：
+#itol_labels_final_SH_v4.txt
+#itol_internal_labels_no_genus_final_SH_v4.txt
+#itol_samples_text_final_SH_v4.txt
+#itol_status_pie_final_SH_v4.txt
+#itol_country_pie_final_SH_v4.txt
+#问题找到了：iTOL 的 DATASET_PIECHART 每一行不是 ID + 数值，而是必须是：
+#ID    position    radius    value1    value2    value3 ...
+#也就是说，你现在的行：
+#sp_Bos_bonasus    0    0    6    0
+#被 iTOL 理解成：
+#ID = sp_Bos_bonasus
+#position = 0
+#radius = 0
+#value1 = 6
+#value2 = 0
+#这样它只读到 2 个 value，但你有 4 个 FIELD_LABELS，所以报：
+#number of fields does not match the number of field labels
+#iTOL 官方模板也说明 pie chart 的每个 node 数据行需要 ID, position, radius, value1, value2, value3...。
+#直接整体覆盖 v4 脚本，在 WSL 里运行：
+cd /mnt/d/ITS_SH_pipeline
+
+cat > globalfungi_style_test/scripts/make_itol_annotations_final_SH_v4.R <<'EOF'
+# make_itol_annotations_final_SH_v4.R
+# 修复 iTOL annotation files:
+# 1. 不显示属名
+# 2. 修复 DATASET_PIECHART 字段数问题
+# 3. tree 使用 v3 的 safe IDs
+
+library(readr)
+library(dplyr)
+library(tidyr)
+library(RColorBrewer)
+
+metadata_file <- "/mnt/d/ITS_SH_pipeline/globalfungi_style_test/metadata/metadata_valid_globalfungi_SH_nozero.csv"
+
+out_dir <- "/mnt/d/ITS_SH_pipeline/globalfungi_style_test/results/itol_final_SH_v4"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+out_labels <- file.path(out_dir, "itol_labels_final_SH_v4.txt")
+out_internal_labels <- file.path(out_dir, "itol_internal_labels_no_genus_final_SH_v4.txt")
+out_samples_text <- file.path(out_dir, "itol_samples_text_final_SH_v4.txt")
+out_status_pie <- file.path(out_dir, "itol_status_pie_final_SH_v4.txt")
+out_country_pie <- file.path(out_dir, "itol_country_pie_final_SH_v4.txt")
+
+safe_id <- function(x) {
+  x <- trimws(as.character(x))
+  x <- gsub("'", "", x)
+  x <- gsub("\\s+", "_", x)
+  x <- gsub("[,;()\\[\\]:]", "_", x)
+  x <- gsub("[^A-Za-z0-9_.-]", "_", x)
+  x
+}
+
+clean_value <- function(x) {
+  x <- trimws(as.character(x))
+  x[is.na(x) | x == "" | x %in% c("NA", "N/A", "missing", "not_recorded", "not reported")] <- "unknown"
+  x
+}
+
+df <- read_csv(metadata_file, show_col_types = FALSE)
+
+df2 <- df %>%
+  mutate(
+    host_order = clean_value(host_order),
+    host_family = clean_value(host_family),
+    host_genus = clean_value(host_genus),
+    host_species = clean_value(host_species),
+    status = clean_value(status),
+    country = clean_value(country)
+  ) %>%
+  filter(
+    host_order != "unknown",
+    host_family != "unknown",
+    host_genus != "unknown",
+    host_species != "unknown"
+  ) %>%
+  mutate(
+    species_id = paste0("sp_", safe_id(host_species)),
+    genus_id = paste0("genus_", safe_id(host_genus)),
+    family_id = paste0("family_", safe_id(host_family)),
+    order_id = paste0("order_", safe_id(host_order))
+  )
+
+species_summary <- df2 %>%
+  group_by(host_order, host_family, host_genus, host_species, species_id, genus_id, family_id, order_id) %>%
+  summarise(number_of_samples = n(), .groups = "drop") %>%
+  arrange(host_order, host_family, host_genus, host_species)
+
+family_summary <- species_summary %>%
+  group_by(host_order, host_family, family_id) %>%
+  summarise(number_of_samples = sum(number_of_samples), .groups = "drop") %>%
+  arrange(host_order, host_family)
+
+order_summary <- species_summary %>%
+  group_by(host_order, order_id) %>%
+  summarise(number_of_samples = sum(number_of_samples), .groups = "drop") %>%
+  arrange(host_order)
+
+# =========================
+# 1. Labels：物种显示正常名；属节点标签设为空
+# =========================
+
+label_df_species <- species_summary %>%
+  distinct(id = species_id, label = host_species)
+
+label_df_genus_blank <- species_summary %>%
+  distinct(id = genus_id) %>%
+  mutate(label = "")
+
+label_df_family <- family_summary %>%
+  mutate(label = paste0(host_family, " n=", number_of_samples)) %>%
+  distinct(id = family_id, label)
+
+label_df_order <- order_summary %>%
+  distinct(id = order_id, label = host_order)
+
+label_df <- bind_rows(
+  tibble(id = "root", label = ""),
+  label_df_order,
+  label_df_family,
+  label_df_genus_blank,
+  label_df_species
+) %>%
+  distinct(id, .keep_all = TRUE)
+
+writeLines(
+  c(
+    "LABELS",
+    "SEPARATOR TAB",
+    "DATA",
+    paste(label_df$id, label_df$label, sep = "\t")
+  ),
+  out_labels
+)
+
+# =========================
+# 2. Internal labels：只显示目和科，不显示属
+# =========================
+
+internal_df <- bind_rows(
+  order_summary %>%
+    transmute(id = order_id, label = host_order),
+  family_summary %>%
+    transmute(id = family_id, label = paste0(host_family, " n=", number_of_samples))
+) %>%
+  distinct(id, .keep_all = TRUE)
+
+writeLines(
+  c(
+    "DATASET_TEXT",
+    "SEPARATOR TAB",
+    "DATASET_LABEL\tTaxonomic labels",
+    "COLOR\t#000000",
+    "DATA",
+    paste(
+      internal_df$id,
+      internal_df$label,
+      "0",
+      "#000000",
+      "normal",
+      "1",
+      "0",
+      sep = "\t"
+    )
+  ),
+  out_internal_labels
+)
+
+# =========================
+# 3. Samples text
+# DATASET_TEXT 每行格式：
+# node_id, text, position, color, style, size, rotation
+# =========================
+
+writeLines(
+  c(
+    "DATASET_TEXT",
+    "SEPARATOR TAB",
+    "DATASET_LABEL\tSamples",
+    "COLOR\t#000000",
+    "DATA",
+    paste(
+      species_summary$species_id,
+      species_summary$number_of_samples,
+      "1",
+      "#000000",
+      "normal",
+      "1",
+      "0",
+      sep = "\t"
+    )
+  ),
+  out_samples_text
+)
+
+# =========================
+# 4. Status pie
+# DATASET_PIECHART 每行格式：
+# node_id, position, radius, value1, value2, ...
+# =========================
+
+df_status <- df2 %>%
+  mutate(
+    status2 = case_when(
+      tolower(status) == "domesticated" ~ "Domesticated",
+      tolower(status) == "captive" ~ "Captive",
+      tolower(status) == "wild" ~ "Wild",
+      TRUE ~ "Unknown"
+    )
+  )
+
+status_levels <- c("Domesticated", "Captive", "Wild", "Unknown")
+status_colors <- c("#14BFC6", "#F26B6B", "#FDB45C", "#BDBDBD")
+
+status_wide <- df_status %>%
+  count(species_id, status2, name = "n") %>%
+  complete(
+    species_id = unique(species_summary$species_id),
+    status2 = status_levels,
+    fill = list(n = 0)
+  ) %>%
+  pivot_wider(names_from = status2, values_from = n, values_fill = 0) %>%
+  arrange(species_id)
+
+for (s in status_levels) {
+  if (!s %in% colnames(status_wide)) status_wide[[s]] <- 0
+}
+status_wide <- status_wide[, c("species_id", status_levels)]
+
+status_data <- apply(status_wide, 1, function(x) {
+  paste(
+    c(
+      x[["species_id"]],
+      "-1",
+      "20",
+      as.character(as.integer(as.numeric(x[status_levels])))
+    ),
+    collapse = "\t"
+  )
+})
+
+writeLines(
+  c(
+    "DATASET_PIECHART",
+    "SEPARATOR TAB",
+    "DATASET_LABEL\tStatus",
+    "COLOR\t#000000",
+    paste0("FIELD_LABELS\t", paste(status_levels, collapse = "\t")),
+    paste0("FIELD_COLORS\t", paste(status_colors, collapse = "\t")),
+    "MAXIMUM_SIZE\t30",
+    "DATA",
+    status_data
+  ),
+  out_status_pie
+)
+
+# =========================
+# 5. Country pie
+# =========================
+
+country_levels <- df2 %>%
+  count(country, name = "n") %>%
+  arrange(desc(n), country) %>%
+  pull(country)
+
+if (length(country_levels) <= 12) {
+  country_colors <- brewer.pal(max(3, length(country_levels)), "Set3")[seq_along(country_levels)]
+} else {
+  country_colors <- colorRampPalette(brewer.pal(12, "Set3"))(length(country_levels))
+}
+
+country_wide <- df2 %>%
+  count(species_id, country, name = "n") %>%
+  complete(
+    species_id = unique(species_summary$species_id),
+    country = country_levels,
+    fill = list(n = 0)
+  ) %>%
+  pivot_wider(names_from = country, values_from = n, values_fill = 0) %>%
+  arrange(species_id)
+
+for (cc in country_levels) {
+  if (!cc %in% colnames(country_wide)) country_wide[[cc]] <- 0
+}
+country_wide <- country_wide[, c("species_id", country_levels)]
+
+country_data <- apply(country_wide, 1, function(x) {
+  paste(
+    c(
+      x[["species_id"]],
+      "-1",
+      "20",
+      as.character(as.integer(as.numeric(x[country_levels])))
+    ),
+    collapse = "\t"
+  )
+})
+
+writeLines(
+  c(
+    "DATASET_PIECHART",
+    "SEPARATOR TAB",
+    "DATASET_LABEL\tCountry",
+    "COLOR\t#000000",
+    paste0("FIELD_LABELS\t", paste(country_levels, collapse = "\t")),
+    paste0("FIELD_COLORS\t", paste(country_colors, collapse = "\t")),
+    "MAXIMUM_SIZE\t30",
+    "DATA",
+    country_data
+  ),
+  out_country_pie
+)
+
+cat("\nDone!\n")
+cat("Output directory:\n", out_dir, "\n\n")
+cat("Files generated:\n")
+cat(out_labels, "\n")
+cat(out_internal_labels, "\n")
+cat(out_samples_text, "\n")
+cat(out_status_pie, "\n")
+cat(out_country_pie, "\n")
+EOF
+#然后直接运行：
+Rscript globalfungi_style_test/scripts/make_itol_annotations_final_SH_v4.R
+#检查 status 文件现在是不是多了 -1 和 20：
+head -15 globalfungi_style_test/results/itol_final_SH_v4/itol_status_pie_final_SH_v4.txt
+#然后在 iTOL 里删掉旧的 Status、Country，重新上传：
+#itol_status_pie_final_SH_v4.txt
+#itol_country_pie_final_SH_v4.txt
