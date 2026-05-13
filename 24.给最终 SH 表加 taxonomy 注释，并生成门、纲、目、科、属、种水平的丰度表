@@ -1,0 +1,240 @@
+#你现在的核心输入是这两个：
+#/mnt/d/ITS_SH_pipeline/globalfungi_style_test/merged/merged_SH_globalfungi_style_nozero.biom
+#/mnt/d/ITS_SH_pipeline/reference/UNITE_SH_taxonomy.tsv
+#1. 先检查 taxonomy 文件格式
+#先运行：
+cd /mnt/d/ITS_SH_pipeline
+
+head -5 reference/UNITE_SH_taxonomy.tsv
+#看一下是不是类似：
+#Feature ID    Taxon
+#SHxxxx        k__Fungi;p__Ascomycota;c__...
+#或者：
+#SHxxxx    Fungi;Ascomycota;...
+#不管是哪种，下面脚本会尽量自动识别。
+#2. 新建 taxonomy 注释脚本
+cd /mnt/d/ITS_SH_pipeline
+
+mkdir -p globalfungi_style_test/scripts
+mkdir -p globalfungi_style_test/taxonomy
+
+cat > globalfungi_style_test/scripts/add_taxonomy_and_collapse_SH_table.py <<'EOF'
+#!/usr/bin/env python3
+
+import sys
+import csv
+import re
+from collections import defaultdict
+from biom import load_table
+from biom.util import biom_open
+
+in_biom = sys.argv[1]
+taxonomy_tsv = sys.argv[2]
+out_dir = sys.argv[3]
+
+import os
+os.makedirs(out_dir, exist_ok=True)
+
+out_taxonomy_matched = os.path.join(out_dir, "SH_taxonomy_matched.tsv")
+out_taxonomy_unmatched = os.path.join(out_dir, "SH_without_taxonomy.txt")
+out_stats = os.path.join(out_dir, "taxonomy_annotation_stats.txt")
+
+levels = ["kingdom", "phylum", "class", "order", "family", "genus", "species"]
+
+def clean_taxon_name(x):
+    x = str(x).strip()
+    x = re.sub(r"^[dkpcofgs]__", "", x)
+    x = re.sub(r"^[A-Za-z]+__", "", x)
+    if x == "" or x.lower() in ["na", "n/a", "none", "unknown", "unidentified", "uncultured"]:
+        return "Unassigned"
+    return x
+
+def split_taxonomy(taxon):
+    taxon = str(taxon).strip()
+    taxon = taxon.replace(",", ";")
+    parts = [clean_taxon_name(p) for p in taxon.split(";")]
+    parts = [p for p in parts if p != ""]
+    while len(parts) < 7:
+        parts.append("Unassigned")
+    return parts[:7]
+
+def normalize_id(x):
+    x = str(x).strip()
+    x = x.split()[0]
+    return x
+
+# 读取 taxonomy
+taxonomy = {}
+
+with open(taxonomy_tsv, "r", newline="") as f:
+    reader = csv.reader(f, delimiter="\t")
+    rows = list(reader)
+
+if len(rows) == 0:
+    raise SystemExit("taxonomy file is empty")
+
+header = [h.strip().lower() for h in rows[0]]
+
+has_header = False
+id_col = 0
+tax_col = 1
+
+if any(h in header for h in ["feature id", "featureid", "feature_id", "id", "sh_id"]) or any(h in header for h in ["taxon", "taxonomy"]):
+    has_header = True
+    for i, h in enumerate(header):
+        if h in ["feature id", "featureid", "feature_id", "id", "sh_id"]:
+            id_col = i
+        if h in ["taxon", "taxonomy"]:
+            tax_col = i
+
+data_rows = rows[1:] if has_header else rows
+
+for row in data_rows:
+    if len(row) <= max(id_col, tax_col):
+        continue
+    sh_id = normalize_id(row[id_col])
+    taxon = row[tax_col].strip()
+    if sh_id == "" or taxon == "":
+        continue
+    taxonomy[sh_id] = split_taxonomy(taxon)
+
+print(f"Taxonomy records loaded: {len(taxonomy)}")
+
+# 读取 BIOM
+table = load_table(in_biom)
+
+sh_ids = list(table.ids(axis="observation"))
+sample_ids = list(table.ids(axis="sample"))
+
+print(f"BIOM SHs: {len(sh_ids)}")
+print(f"BIOM samples: {len(sample_ids)}")
+
+matched = {}
+unmatched = []
+
+for sh in sh_ids:
+    sh_norm = normalize_id(sh)
+    if sh in taxonomy:
+        matched[sh] = taxonomy[sh]
+    elif sh_norm in taxonomy:
+        matched[sh] = taxonomy[sh_norm]
+    else:
+        unmatched.append(sh)
+
+print(f"Matched SHs: {len(matched)}")
+print(f"Unmatched SHs: {len(unmatched)}")
+
+# 输出 SH taxonomy matched table
+with open(out_taxonomy_matched, "w", newline="") as f:
+    writer = csv.writer(f, delimiter="\t")
+    writer.writerow(["SH_ID"] + levels)
+    for sh in sh_ids:
+        vals = matched.get(sh, ["Unassigned"] * 7)
+        writer.writerow([sh] + vals)
+
+with open(out_taxonomy_unmatched, "w") as f:
+    for sh in unmatched:
+        f.write(str(sh) + "\n")
+
+# 给 biom 加 observation metadata
+obs_metadata = {}
+for sh in sh_ids:
+    vals = matched.get(sh, ["Unassigned"] * 7)
+    obs_metadata[sh] = {lev: val for lev, val in zip(levels, vals)}
+
+table.add_metadata(obs_metadata, axis="observation")
+
+out_biom_tax = os.path.join(out_dir, "merged_SH_globalfungi_style_nozero_with_taxonomy.biom")
+with biom_open(out_biom_tax, "w") as f:
+    table.to_hdf5(f, generated_by="add_taxonomy_and_collapse_SH_table.py")
+
+# 按分类水平 collapse
+for lev in levels:
+    print(f"Collapsing to {lev} level...")
+    collapsed = table.collapse(
+        lambda id_, md: md.get(lev, "Unassigned"),
+        axis="observation",
+        norm=False,
+        include_collapsed_metadata=False
+    )
+    out_biom = os.path.join(out_dir, f"{lev}_abundance_table.biom")
+    with biom_open(out_biom, "w") as f:
+        collapsed.to_hdf5(f, generated_by=f"collapse_to_{lev}")
+
+    # 输出一个相对小的 TSV，后面 R 作图方便
+    out_tsv = os.path.join(out_dir, f"{lev}_abundance_table.tsv")
+    with open(out_tsv, "w", newline="") as f:
+        writer = csv.writer(f, delimiter="\t")
+        writer.writerow([lev] + sample_ids)
+        for obs_id in collapsed.ids(axis="observation"):
+            values = collapsed.data(obs_id, axis="observation")
+            row = [obs_id] + [int(v) if float(v).is_integer() else float(v) for v in values]
+            writer.writerow(row)
+
+# 每个水平总丰度统计
+for lev in levels:
+    in_tsv = os.path.join(out_dir, f"{lev}_abundance_table.tsv")
+    out_sum = os.path.join(out_dir, f"{lev}_total_abundance_summary.tsv")
+
+    totals = []
+    with open(in_tsv, "r", newline="") as f:
+        reader = csv.reader(f, delimiter="\t")
+        header = next(reader)
+        for row in reader:
+            taxon = row[0]
+            counts = [float(x) for x in row[1:]]
+            totals.append((taxon, sum(counts), sum(1 for x in counts if x > 0)))
+
+    totals.sort(key=lambda x: x[1], reverse=True)
+
+    with open(out_sum, "w", newline="") as f:
+        writer = csv.writer(f, delimiter="\t")
+        writer.writerow([lev, "total_reads", "number_of_samples_present"])
+        for x in totals:
+            writer.writerow(x)
+
+with open(out_stats, "w") as f:
+    f.write(f"input_biom\t{in_biom}\n")
+    f.write(f"taxonomy_file\t{taxonomy_tsv}\n")
+    f.write(f"BIOM_SHs\t{len(sh_ids)}\n")
+    f.write(f"BIOM_samples\t{len(sample_ids)}\n")
+    f.write(f"taxonomy_records_loaded\t{len(taxonomy)}\n")
+    f.write(f"matched_SHs\t{len(matched)}\n")
+    f.write(f"unmatched_SHs\t{len(unmatched)}\n")
+    if len(sh_ids) > 0:
+        f.write(f"matched_SH_percent\t{len(matched)/len(sh_ids)*100:.4f}\n")
+    f.write(f"output_taxonomy_biom\t{out_biom_tax}\n")
+
+print("Done.")
+print(f"Output directory: {out_dir}")
+EOF
+#3. 运行 taxonomy 注释和分类水平汇总
+python globalfungi_style_test/scripts/add_taxonomy_and_collapse_SH_table.py \
+  globalfungi_style_test/merged/merged_SH_globalfungi_style_nozero.biom \
+  reference/UNITE_SH_taxonomy.tsv \
+  globalfungi_style_test/taxonomy
+#4. 查看注释结果
+cat globalfungi_style_test/taxonomy/taxonomy_annotation_stats.txt
+#重点看这几行：
+#BIOM_SHs
+#matched_SHs
+#unmatched_SHs
+#matched_SH_percent
+#如果 matched_SH_percent 很高，比如接近 100%，说明 SH_ID 和 taxonomy 文件匹配正常。
+#再看前几行 taxonomy：
+head globalfungi_style_test/taxonomy/SH_taxonomy_matched.tsv
+#5. 生成的关键文件
+#运行成功后，主要有这些：
+#globalfungi_style_test/taxonomy/merged_SH_globalfungi_style_nozero_with_taxonomy.biom
+#globalfungi_style_test/taxonomy/SH_taxonomy_matched.tsv
+#globalfungi_style_test/taxonomy/phylum_abundance_table.tsv
+#globalfungi_style_test/taxonomy/class_abundance_table.tsv
+#globalfungi_style_test/taxonomy/order_abundance_table.tsv
+#globalfungi_style_test/taxonomy/family_abundance_table.tsv
+#globalfungi_style_test/taxonomy/genus_abundance_table.tsv
+#globalfungi_style_test/taxonomy/species_abundance_table.tsv
+#后面你写论文和作图主要用：
+#SH_taxonomy_matched.tsv
+#phylum_abundance_table.tsv
+#family_abundance_table.tsv
+#genus_abundance_table.tsv
