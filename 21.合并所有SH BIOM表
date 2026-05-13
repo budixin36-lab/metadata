@@ -366,3 +366,24 @@ head globalfungi_style_test/metadata/summary/status_count_final_SH.csv
 #新的图 2-1 和图 2-2 也应该基于：
 #/mnt/d/ITS_SH_pipeline/globalfungi_style_test/metadata/metadata_valid_globalfungi_SH_nozero.csv
 #来重新生成。
+#在 WSL 里用 R 统计。你的最终 metadata 文件是：
+#/mnt/d/ITS_SH_pipeline/globalfungi_style_test/metadata/metadata_valid_globalfungi_SH_nozero.csv
+#运行：
+R
+#然后输入：
+df <- read.csv("/mnt/d/ITS_SH_pipeline/globalfungi_style_test/metadata/metadata_valid_globalfungi_SH_nozero.csv",
+               stringsAsFactors = FALSE,
+               check.names = FALSE)
+
+length(unique(df$BioProject))
+#这会输出 BioProject 数量。
+#如果想顺便生成每个 BioProject 对应多少样本：
+out <- as.data.frame(table(df$BioProject))
+colnames(out) <- c("BioProject", "number_of_samples")
+out <- out[order(out$number_of_samples, decreasing = TRUE), ]
+
+write.csv(out,
+          "/mnt/d/ITS_SH_pipeline/globalfungi_style_test/metadata/summary/bioproject_count_final_SH.csv",
+          row.names = FALSE)
+#退出 R：
+q()
