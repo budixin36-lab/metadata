@@ -6,18 +6,363 @@
 #不要先分别在每个 batch 里删，因为你最终要的是一个统一的 SH 表。
 #你的批量流程已经跑完了，日志显示所有 batch 都生成了 SH 表和 mapping stats。比如 paired_ITS2 映射率是 36.3372%，single_ITS2 是 7.1861%，不同批次差异比较大。 
 #另外你之前 paired_ITS2 的 BIOM summary 里已经出现了 Min: 0.000，说明确实有样本在严格 GlobalFungi-style 筛选后没有任何 SH reads，需要删掉。
-#1. 先合并所有 SH BIOM 表
-#运行：
+#当前 biom 版本里没有 merge 这个子命令。用 Python 读取多个 BIOM 并合并，更稳。
+#1. 新建合并脚本
 cd /mnt/d/ITS_SH_pipeline
 
-mkdir -p globalfungi_style_test/merged
+nano globalfungi_style_test/scripts/merge_sh_biom_tables.py
+#粘贴：
+#!/usr/bin/env python3
 
-biom merge \
-  -i $(ls globalfungi_style_test/results/*_SH_table_globalfungi_style.biom | paste -sd, -) \
-  -o globalfungi_style_test/merged/merged_SH_globalfungi_style_raw.biom
-#看一下合并后的概况：
+import sys
+import glob
+from biom import load_table
+from biom.util import biom_open
+
+pattern = sys.argv[1]
+out_biom = sys.argv[2]
+
+files = sorted(glob.glob(pattern))
+
+if len(files) == 0:
+    raise SystemExit(f"No BIOM files found: {pattern}")
+
+print(f"Found {len(files)} BIOM files")
+
+merged = None
+
+for i, f in enumerate(files, 1):
+    print(f"[{i}/{len(files)}] Loading {f}")
+    table = load_table(f)
+
+    print(
+        f"  samples={len(table.ids(axis='sample'))}, "
+        f"SHs={len(table.ids(axis='observation'))}, "
+        f"total={table.sum()}"
+    )
+
+    if merged is None:
+        merged = table
+    else:
+        merged = merged.merge(table)
+
+    print(
+        f"  merged so far: samples={len(merged.ids(axis='sample'))}, "
+        f"SHs={len(merged.ids(axis='observation'))}, "
+        f"total={merged.sum()}"
+    )
+
+print("Writing merged BIOM table...")
+with biom_open(out_biom, "w") as f:
+    merged.to_hdf5(f, generated_by="merge_sh_biom_tables.py")
+
+print(f"Done: {out_biom}")
+#2. 运行合并
+python globalfungi_style_test/scripts/merge_sh_biom_tables.py \
+  "globalfungi_style_test/results/*_SH_table_globalfungi_style.biom" \
+  globalfungi_style_test/merged/merged_SH_globalfungi_style_raw.biom
+#3. 查看合并结果
 biom summarize-table \
   -i globalfungi_style_test/merged/merged_SH_globalfungi_style_raw.biom \
   > globalfungi_style_test/merged/merged_SH_globalfungi_style_raw_summary.txt
 
 less globalfungi_style_test/merged/merged_SH_globalfungi_style_raw_summary.txt
+#退出回到终端，按：
+q
+#你第二章“数据来源与数据库构建”里
+#最终进入 SH 表并用于后续群落分析的样本
+#这才是后面图 2-1、图 2-2 最应该展示的样本。
+#如果你图 2-1 和图 2-2 是为了说明“本研究最终分析样本的国家分布和物种分布”，那就应该基于剔除 0 SH reads 后的最终样本重新画。
+#2. 为什么要剔除 0 个 SH 的样本？
+#因为这类样本在最终 SH 表里是：所有 SH 丰度 = 0，它们没有可用于群落分析的信息。
+#如果保留，会导致几个问题：
+#alpha diversity = 0 或 NA
+#Bray-Curtis 距离可能异常
+#PCoA/NMDS 可能受影响
+#PERMANOVA 分组结果可能失真
+#样本数量统计虚高
+#所以别人一般也会做类似处理，只是表述不一定叫“剔除 0 个 SH 样本”，常见写法是：
+#经序列质控、ITS 区域提取及 SH 注释后，未获得任何真菌 SH 注释序列的样本不纳入后续群落组成及多样性分析。
+#3. 你截图里的两张图需要改吗？要改。
+#尤其是图 2-1 国家样本数量图和图 2-2 物种分类层级图。
+#4. 现在下一步应该做什么？
+#你现在先不要急着改论文文字。下一步应该是：
+#1. 合并所有 GlobalFungi-style SH 表；
+#2. 删除 SH reads = 0 的样本；
+#3. 输出最终样本 ID；
+#4. 用最终样本 ID 过滤 metadata_valid；
+#5. 重新统计国家、物种、科、目、status；
+#6. 重新生成图 2-1 和图 2-2；
+#7. 再回头修改第二章文字里的样本数量。
+#你现在已经在第 1 步附近了，但刚才 biom merge 不支持，所以应该用我前面给你的 Python 合并脚本继续。
+#5. 你现在继续运行这几步
+#第一步：确认合并表是否已经生成
+#先运行：
+cd /mnt/d/ITS_SH_pipeline
+
+ls -lh globalfungi_style_test/merged/merged_SH_globalfungi_style_raw.biom
+#第二步：删除 0 SH reads 样本
+cd /mnt/d/ITS_SH_pipeline
+
+nano globalfungi_style_test/scripts/filter_zero_samples_biom.py
+#粘贴下面内容：
+#!/usr/bin/env python3
+
+import sys
+import csv
+from biom import load_table
+from biom.util import biom_open
+
+in_biom = sys.argv[1]
+out_biom = sys.argv[2]
+removed_samples_file = sys.argv[3]
+sample_counts_file = sys.argv[4]
+
+table = load_table(in_biom)
+
+sample_ids = list(table.ids(axis="sample"))
+sample_sums = table.sum(axis="sample")
+
+keep_samples = []
+removed_samples = []
+
+for sid, total in zip(sample_ids, sample_sums):
+    if total > 0:
+        keep_samples.append(sid)
+    else:
+        removed_samples.append((sid, total))
+
+filtered = table.filter(keep_samples, axis="sample", inplace=False)
+
+# 删除在保留样本中总丰度为 0 的 SH
+obs_ids = list(filtered.ids(axis="observation"))
+obs_sums = filtered.sum(axis="observation")
+keep_obs = [oid for oid, total in zip(obs_ids, obs_sums) if total > 0]
+filtered = filtered.filter(keep_obs, axis="observation", inplace=False)
+
+with biom_open(out_biom, "w") as f:
+    filtered.to_hdf5(f, generated_by="filter_zero_samples_biom.py")
+
+with open(removed_samples_file, "w", newline="") as f:
+    writer = csv.writer(f, delimiter="\t")
+    writer.writerow(["sample_id", "SH_reads"])
+    for sid, total in removed_samples:
+        writer.writerow([sid, int(total)])
+
+with open(sample_counts_file, "w", newline="") as f:
+    writer = csv.writer(f, delimiter="\t")
+    writer.writerow(["sample_id", "SH_reads"])
+    for sid, total in zip(sample_ids, sample_sums):
+        writer.writerow([sid, int(total)])
+
+print("Original samples:", len(sample_ids))
+print("Kept samples:", len(keep_samples))
+print("Removed zero-SH samples:", len(removed_samples))
+print("Original SHs:", len(table.ids(axis="observation")))
+print("Filtered SHs:", len(filtered.ids(axis="observation")))
+print("Output:", out_biom)
+#运行：
+python globalfungi_style_test/scripts/filter_zero_samples_biom.py \
+  globalfungi_style_test/merged/merged_SH_globalfungi_style_raw.biom \
+  globalfungi_style_test/merged/merged_SH_globalfungi_style_nozero.biom \
+  globalfungi_style_test/merged/removed_zero_SH_samples.tsv \
+  globalfungi_style_test/merged/sample_SH_read_counts_raw.tsv
+#第三步：看删掉了多少样本
+cat globalfungi_style_test/merged/removed_zero_SH_samples.tsv | head
+wc -l globalfungi_style_test/merged/removed_zero_SH_samples.tsv
+#注意 wc -l 包含表头，所以真正删除样本数是：行数 - 1
+#第四步：导出最终样本 ID
+#当前 biom table-ids 版本不支持 --axis sample。我们改用 Python 导出样本 ID。
+#1. 新建导出样本 ID 脚本
+cd /mnt/d/ITS_SH_pipeline
+
+nano globalfungi_style_test/scripts/export_biom_sample_ids.py
+#粘贴：
+#!/usr/bin/env python3
+
+import sys
+from biom import load_table
+
+in_biom = sys.argv[1]
+out_txt = sys.argv[2]
+
+table = load_table(in_biom)
+
+with open(out_txt, "w") as f:
+    for sid in table.ids(axis="sample"):
+        f.write(str(sid) + "\n")
+
+print("Sample count:", len(table.ids(axis="sample")))
+print("Output:", out_txt)
+#2. 导出最终样本 ID
+python globalfungi_style_test/scripts/export_biom_sample_ids.py \
+  globalfungi_style_test/merged/merged_SH_globalfungi_style_nozero.biom \
+  globalfungi_style_test/merged/final_SH_sample_ids.txt
+#查看最终样本数：
+wc -l globalfungi_style_test/merged/final_SH_sample_ids.txt
+head globalfungi_style_test/merged/final_SH_sample_ids.txt
+#3. 再看过滤后的 SH 表概况
+biom summarize-table \
+  -i globalfungi_style_test/merged/merged_SH_globalfungi_style_nozero.biom \
+  > globalfungi_style_test/merged/merged_SH_globalfungi_style_nozero_summary.txt
+
+less globalfungi_style_test/merged/merged_SH_globalfungi_style_nozero_summary.txt
+#按 q 退出 less。
+#现在你已经完成了：合并 SH 表、删除 0 SH 样本、导出最终样本 ID
+#下一步：用最终 SH 样本 ID 过滤 metadata_valid，生成最终用于分析的 metadata，并重新统计国家、物种、科、目、status 的样本数量。
+#1. 确认最终样本 ID 文件存在
+cd /mnt/d/ITS_SH_pipeline
+
+wc -l globalfungi_style_test/merged/final_SH_sample_ids.txt
+head globalfungi_style_test/merged/final_SH_sample_ids.txt
+#这个行数就是 SH reads > 0 的最终样本数。
+#2. 用 final_SH_sample_ids 过滤 metadata_valid
+#先新建 R 脚本：
+nano globalfungi_style_test/scripts/filter_metadata_by_final_SH_samples.R
+#粘贴：
+# filter_metadata_by_final_SH_samples.R
+
+library(readr)
+library(dplyr)
+
+metadata_file <- "/mnt/d/PRJmetadata/metadata_valid.csv"
+sample_id_file <- "/mnt/d/ITS_SH_pipeline/globalfungi_style_test/merged/final_SH_sample_ids.txt"
+
+out_dir <- "/mnt/d/ITS_SH_pipeline/globalfungi_style_test/metadata"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+out_metadata <- file.path(out_dir, "metadata_valid_globalfungi_SH_nozero.csv")
+out_missing_in_metadata <- file.path(out_dir, "final_SH_samples_missing_in_metadata.txt")
+out_metadata_not_in_SH <- file.path(out_dir, "metadata_valid_samples_not_in_final_SH.txt")
+out_summary <- file.path(out_dir, "metadata_filter_summary.txt")
+
+metadata <- read_csv(metadata_file, show_col_types = FALSE)
+final_ids <- read_lines(sample_id_file)
+final_ids <- unique(trimws(final_ids))
+final_ids <- final_ids[final_ids != ""]
+
+# 自动识别样本 ID 列
+possible_id_cols <- c("sample_id", "SampleID", "sampleid", "sample_name", "Sample", "run_accession", "Run", "SRR", "srr")
+id_col <- possible_id_cols[possible_id_cols %in% colnames(metadata)][1]
+
+if (is.na(id_col)) {
+  stop("没有找到样本 ID 列。请检查 metadata_valid.csv 里样本 ID 列叫什么。")
+}
+
+metadata <- metadata %>%
+  mutate(.sample_id_for_match = trimws(as.character(.data[[id_col]])))
+
+metadata_final <- metadata %>%
+  filter(.sample_id_for_match %in% final_ids) %>%
+  select(-.sample_id_for_match)
+
+missing_in_metadata <- setdiff(final_ids, metadata$.sample_id_for_match)
+metadata_not_in_SH <- setdiff(metadata$.sample_id_for_match, final_ids)
+
+write_csv(metadata_final, out_metadata)
+write_lines(missing_in_metadata, out_missing_in_metadata)
+write_lines(metadata_not_in_SH, out_metadata_not_in_SH)
+
+summary_text <- c(
+  paste0("metadata_file: ", metadata_file),
+  paste0("sample_id_column_used: ", id_col),
+  paste0("metadata_valid_samples: ", nrow(metadata)),
+  paste0("final_SH_sample_ids: ", length(final_ids)),
+  paste0("metadata_final_samples: ", nrow(metadata_final)),
+  paste0("final_SH_samples_missing_in_metadata: ", length(missing_in_metadata)),
+  paste0("metadata_samples_not_in_final_SH: ", length(metadata_not_in_SH)),
+  paste0("output_metadata: ", out_metadata)
+)
+
+write_lines(summary_text, out_summary)
+
+cat(paste(summary_text, collapse = "\n"))
+cat("\n")
+#运行：
+Rscript globalfungi_style_test/scripts/filter_metadata_by_final_SH_samples.R
+#3. 查看过滤结果
+cat globalfungi_style_test/metadata/metadata_filter_summary.txt
+#重点看这几行：
+#final_SH_sample_ids
+#metadata_final_samples
+#final_SH_samples_missing_in_metadata
+#正常情况下，metadata_final_samples 应该和 final_SH_sample_ids 接近或完全一致。
+#4. 重新统计国家、物种、科、目、status
+#新建 R 脚本：
+nano globalfungi_style_test/scripts/summarize_final_metadata.R
+#粘贴：
+# summarize_final_metadata.R
+
+library(readr)
+library(dplyr)
+
+metadata_file <- "/mnt/d/ITS_SH_pipeline/globalfungi_style_test/metadata/metadata_valid_globalfungi_SH_nozero.csv"
+
+out_dir <- "/mnt/d/ITS_SH_pipeline/globalfungi_style_test/metadata/summary"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+df <- read_csv(metadata_file, show_col_types = FALSE)
+
+count_col <- function(data, col, out_name) {
+  if (!col %in% colnames(data)) {
+    message("Skip missing column: ", col)
+    return(NULL)
+  }
+  
+  out <- data %>%
+    mutate(value = trimws(as.character(.data[[col]]))) %>%
+    mutate(value = ifelse(is.na(value) | value == "", "unknown", value)) %>%
+    count(value, name = "number_of_samples") %>%
+    arrange(desc(number_of_samples))
+  
+  write_csv(out, file.path(out_dir, out_name))
+  out
+}
+
+country_count <- count_col(df, "country", "country_count_final_SH.csv")
+host_species_count <- count_col(df, "host_species", "host_species_count_final_SH.csv")
+host_family_count <- count_col(df, "host_family", "host_family_count_final_SH.csv")
+host_order_count <- count_col(df, "host_order", "host_order_count_final_SH.csv")
+status_count <- count_col(df, "status", "status_count_final_SH.csv")
+
+# 总览
+overview <- tibble(
+  item = c(
+    "final_metadata_samples",
+    "unique_countries",
+    "unique_host_species",
+    "unique_host_families",
+    "unique_host_orders"
+  ),
+  value = c(
+    nrow(df),
+    if ("country" %in% names(df)) n_distinct(df$country, na.rm = TRUE) else NA,
+    if ("host_species" %in% names(df)) n_distinct(df$host_species, na.rm = TRUE) else NA,
+    if ("host_family" %in% names(df)) n_distinct(df$host_family, na.rm = TRUE) else NA,
+    if ("host_order" %in% names(df)) n_distinct(df$host_order, na.rm = TRUE) else NA
+  )
+)
+
+write_csv(overview, file.path(out_dir, "final_metadata_overview.csv"))
+
+cat("Done!\n")
+cat("Output directory:\n")
+cat(out_dir, "\n")
+#保存退出后运行：
+Rscript globalfungi_style_test/scripts/summarize_final_metadata.R
+#5. 查看新的统计结果
+cat globalfungi_style_test/metadata/summary/final_metadata_overview.csv
+
+head globalfungi_style_test/metadata/summary/country_count_final_SH.csv
+head globalfungi_style_test/metadata/summary/host_species_count_final_SH.csv
+head globalfungi_style_test/metadata/summary/host_family_count_final_SH.csv
+head globalfungi_style_test/metadata/summary/host_order_count_final_SH.csv
+head globalfungi_style_test/metadata/summary/status_count_final_SH.csv
+#这些文件就是你后面重画图 2-1 和图 2-2 的基础。
+#6. 你论文里接下来要改的数字
+#等上面跑完后，用这个文件里的数
+#/mnt/d/ITS_SH_pipeline/globalfungi_style_test/metadata/summary/final_metadata_overview.csv
+#替换你第二章里这些内容：3256 份样本、14 个国家、24 个物种、6 科、3 目
+#新的图 2-1 和图 2-2 也应该基于：
+#/mnt/d/ITS_SH_pipeline/globalfungi_style_test/metadata/metadata_valid_globalfungi_SH_nozero.csv
+#来重新生成。
