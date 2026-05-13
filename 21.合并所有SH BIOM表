@@ -1,0 +1,23 @@
+#先合并所有 *_SH_table_globalfungi_style.biom
+#→ 再删除总 SH reads = 0 的样本
+#→ 再统计每个样本的 SH reads 数
+#→ 决定是否进一步删除极低 reads 样本
+#→ 再和 metadata_valid 匹配
+#不要先分别在每个 batch 里删，因为你最终要的是一个统一的 SH 表。
+#你的批量流程已经跑完了，日志显示所有 batch 都生成了 SH 表和 mapping stats。比如 paired_ITS2 映射率是 36.3372%，single_ITS2 是 7.1861%，不同批次差异比较大。 
+#另外你之前 paired_ITS2 的 BIOM summary 里已经出现了 Min: 0.000，说明确实有样本在严格 GlobalFungi-style 筛选后没有任何 SH reads，需要删掉。
+#1. 先合并所有 SH BIOM 表
+#运行：
+cd /mnt/d/ITS_SH_pipeline
+
+mkdir -p globalfungi_style_test/merged
+
+biom merge \
+  -i $(ls globalfungi_style_test/results/*_SH_table_globalfungi_style.biom | paste -sd, -) \
+  -o globalfungi_style_test/merged/merged_SH_globalfungi_style_raw.biom
+#看一下合并后的概况：
+biom summarize-table \
+  -i globalfungi_style_test/merged/merged_SH_globalfungi_style_raw.biom \
+  > globalfungi_style_test/merged/merged_SH_globalfungi_style_raw_summary.txt
+
+less globalfungi_style_test/merged/merged_SH_globalfungi_style_raw_summary.txt
