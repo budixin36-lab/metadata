@@ -1,0 +1,1254 @@
+#建议第三章先这样排：
+#3.1 有蹄类动物肠道真菌 SH 的共享与特异分布
+#图3-1：宿主科水平共享/独有 SH 的 UpSet 图
+#图3-2：所有宿主科共有 SH 的门水平组成图
+#3.2 有蹄类动物肠道真菌群落组成特征
+#图3-3：宿主科水平门水平组成堆叠柱状图
+#图3-4：宿主科 × Top20 真菌属弦图或热图
+#图3-5：宿主科主要真菌属功能型组成图
+#3.3 不同宿主类群肠道真菌 alpha 多样性差异
+#图3-6：宿主科水平 alpha 多样性箱线图
+#图3-7：宿主物种水平 alpha 多样性箱线图
+#表3-1：宿主科水平 ANOVA + TukeyHSD
+#表3-2：宿主物种水平 ANOVA + TukeyHSD
+#3.4 不同宿主类群肠道真菌 beta 多样性差异
+#图3-8：宿主科水平 NMDS
+#图3-9：宿主物种水平 NMDS
+#表3-3：Adonis 检验结果
+#3.5 宿主类群间差异富集真菌类群
+#图3-10：宿主科水平 LEfSe LDA score
+#图3-11：宿主物种水平 LEfSe LDA score
+#表3-4：差异富集真菌类群列表
+#下面先做宿主科水平 UpSet 图和所有宿主科共有 SH 的门水平组成图。
+#输出目录我建议统一放在：
+#/mnt/d/ITS_SH_pipeline/globalfungi_style_test/results/chapter3_host_family_upset
+#1. 在 WSL 终端运行 R 脚本
+#先在 WSL 里进入项目目录：
+cd /mnt/d/ITS_SH_pipeline
+#然后新建脚本：
+mkdir -p scripts
+nano scripts/03_host_family_upset_shared_phylum.R
+#把下面整段复制进去：
+# ============================================================
+# Chapter 3: Host family-level shared/unique SH UpSet plot
+# and phylum composition of SHs shared by all host families
+#
+# Input:
+#   1. merged_SH_globalfungi_style_nozero_with_taxonomy.biom
+#   2. metadata_valid_globalfungi_SH_nozero.csv
+#   3. SH_taxonomy_matched.tsv
+#
+# Output:
+#   results/chapter3_host_family_upset/
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(biomformat)
+  library(tidyverse)
+  library(Matrix)
+  library(UpSetR)
+  library(scales)
+})
+
+# -----------------------------
+# 1. Paths
+# -----------------------------
+base_dir <- "/mnt/d/ITS_SH_pipeline/globalfungi_style_test"
+
+biom_file <- file.path(
+  base_dir,
+  "taxonomy/merged_SH_globalfungi_style_nozero_with_taxonomy.biom"
+)
+
+metadata_file <- file.path(
+  base_dir,
+  "metadata/metadata_valid_globalfungi_SH_nozero.csv"
+)
+
+taxonomy_file <- file.path(
+  base_dir,
+  "taxonomy/SH_taxonomy_matched.tsv"
+)
+
+out_dir <- file.path(
+  base_dir,
+  "results/chapter3_host_family_upset"
+)
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# -----------------------------
+# 2. Read metadata
+# -----------------------------
+meta <- read.csv(
+  metadata_file,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+# 检查宿主科列
+if (!"host_family" %in% colnames(meta)) {
+  stop("metadata 中没有 host_family 列，请检查列名。")
+}
+
+# 猜测样本 ID 列
+possible_sample_cols <- c("sample_id", "SampleID", "sampleid", "sample_name", "id", "#SampleID")
+sample_col <- possible_sample_cols[possible_sample_cols %in% colnames(meta)][1]
+
+if (is.na(sample_col)) {
+  stop("没有找到样本 ID 列。请检查 metadata 中样本 ID 列名。")
+}
+
+meta <- meta %>%
+  mutate(
+    sample_id = .data[[sample_col]],
+    host_family = trimws(as.character(host_family))
+  ) %>%
+  filter(
+    !is.na(sample_id),
+    sample_id != "",
+    !is.na(host_family),
+    host_family != "",
+    host_family != "NA",
+    host_family != "missing",
+    host_family != "not_recorded",
+    host_family != "not reported"
+  )
+
+cat("Metadata samples after filtering host_family:", nrow(meta), "\n")
+cat("Host families:\n")
+print(sort(table(meta$host_family), decreasing = TRUE))
+
+# -----------------------------
+# 3. Read BIOM table
+# -----------------------------
+biom <- read_biom(biom_file)
+mat <- as(biom_data(biom), "matrix")
+
+# biomformat 读出来通常是 feature x sample
+cat("Original BIOM matrix dimension:", nrow(mat), "features x", ncol(mat), "samples\n")
+
+# 对齐 metadata 和 biom 样本
+common_samples <- intersect(colnames(mat), meta$sample_id)
+
+if (length(common_samples) == 0) {
+  stop("BIOM 样本名和 metadata 样本名没有交集，请检查 sample_id 列。")
+}
+
+mat <- mat[, common_samples, drop = FALSE]
+meta2 <- meta %>%
+  filter(sample_id %in% common_samples) %>%
+  distinct(sample_id, .keep_all = TRUE)
+
+# 按 biom 样本顺序排列 metadata
+meta2 <- meta2[match(colnames(mat), meta2$sample_id), ]
+
+cat("Matched samples:", ncol(mat), "\n")
+cat("Matched host families:\n")
+print(sort(table(meta2$host_family), decreasing = TRUE))
+
+# -----------------------------
+# 4. Build SH presence/absence by host family
+# -----------------------------
+host_families <- sort(unique(meta2$host_family))
+
+# 每个 SH 在每个 host_family 中是否出现过
+presence_list <- list()
+
+for (hf in host_families) {
+  samples_hf <- meta2$sample_id[meta2$host_family == hf]
+  sub_mat <- mat[, samples_hf, drop = FALSE]
+  present_sh <- rownames(sub_mat)[rowSums(sub_mat > 0) > 0]
+  presence_list[[hf]] <- present_sh
+}
+
+# 保存每个宿主科检测到的 SH 数
+set_size_df <- tibble(
+  host_family = names(presence_list),
+  SH_number = lengths(presence_list)
+) %>%
+  arrange(desc(SH_number))
+
+write.csv(
+  set_size_df,
+  file.path(out_dir, "host_family_SH_set_size.csv"),
+  row.names = FALSE
+)
+
+# 生成 UpSetR 输入矩阵
+all_sh <- sort(unique(unlist(presence_list)))
+
+upset_df <- tibble(SH_ID = all_sh)
+
+for (hf in host_families) {
+  upset_df[[hf]] <- as.integer(upset_df$SH_ID %in% presence_list[[hf]])
+}
+
+write.csv(
+  upset_df,
+  file.path(out_dir, "host_family_SH_presence_absence_matrix.csv"),
+  row.names = FALSE
+)
+
+# -----------------------------
+# 5. Shared SHs among all host families
+# -----------------------------
+shared_sh <- Reduce(intersect, presence_list)
+
+cat("Number of SHs shared by all host families:", length(shared_sh), "\n")
+
+write.table(
+  shared_sh,
+  file.path(out_dir, "shared_SHs_all_host_families.txt"),
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = FALSE,
+  sep = "\t"
+)
+
+# -----------------------------
+# 6. UpSet plot
+# -----------------------------
+upset_input <- as.data.frame(upset_df)
+rownames(upset_input) <- upset_input$SH_ID
+upset_input$SH_ID <- NULL
+
+# 按集合大小排序
+set_order <- set_size_df$host_family
+
+pdf(
+  file.path(out_dir, "Fig3_1_host_family_shared_unique_SH_UpSet.pdf"),
+  width = 12,
+  height = 7,
+  family = "Times"
+)
+
+upset(
+  upset_input,
+  sets = set_order,
+  nsets = length(set_order),
+  nintersects = 60,
+  order.by = "freq",
+  decreasing = TRUE,
+  mainbar.y.label = "Intersection size",
+  sets.x.label = "SH number",
+  text.scale = c(1.5, 1.4, 1.2, 1.2, 1.4, 1.3),
+  point.size = 2.8,
+  line.size = 0.8,
+  mb.ratio = c(0.65, 0.35)
+)
+
+dev.off()
+
+png(
+  file.path(out_dir, "Fig3_1_host_family_shared_unique_SH_UpSet.png"),
+  width = 3600,
+  height = 2100,
+  res = 300
+)
+
+upset(
+  upset_input,
+  sets = set_order,
+  nsets = length(set_order),
+  nintersects = 60,
+  order.by = "freq",
+  decreasing = TRUE,
+  mainbar.y.label = "Intersection size",
+  sets.x.label = "SH number",
+  text.scale = c(1.5, 1.4, 1.2, 1.2, 1.4, 1.3),
+  point.size = 2.8,
+  line.size = 0.8,
+  mb.ratio = c(0.65, 0.35)
+)
+
+dev.off()
+
+# -----------------------------
+# 7. Read taxonomy and parse phylum
+# -----------------------------
+tax_raw <- read.delim(
+  taxonomy_file,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+cat("Taxonomy columns:\n")
+print(colnames(tax_raw))
+
+# 自动识别 SH ID 列
+possible_id_cols <- c("SH", "SH_ID", "Feature.ID", "FeatureID", "feature_id", "ID", "id", "#OTUID", "OTUID")
+id_col <- possible_id_cols[possible_id_cols %in% colnames(tax_raw)][1]
+
+if (is.na(id_col)) {
+  id_col <- colnames(tax_raw)[1]
+  message("未识别标准 SH ID 列，默认使用 taxonomy 第一列：", id_col)
+}
+
+# 自动识别 taxonomy 列
+possible_tax_cols <- c("taxonomy", "Taxon", "taxon", "Taxonomy", "UNITE_taxonomy")
+tax_col <- possible_tax_cols[possible_tax_cols %in% colnames(tax_raw)][1]
+
+if (is.na(tax_col)) {
+  # 如果没有单独 taxonomy 列，就尝试是否已有 phylum 列
+  if ("phylum" %in% colnames(tax_raw)) {
+    tax_df <- tax_raw %>%
+      transmute(
+        SH_ID = .data[[id_col]],
+        phylum = as.character(phylum)
+      )
+  } else {
+    stop("taxonomy 文件中没有识别到 taxonomy 或 phylum 列，请检查 SH_taxonomy_matched.tsv。")
+  }
+} else {
+  tax_df <- tax_raw %>%
+    transmute(
+      SH_ID = .data[[id_col]],
+      taxonomy = as.character(.data[[tax_col]])
+    ) %>%
+    mutate(
+      phylum = str_extract(taxonomy, "p__[^;|]+"),
+      phylum = str_replace(phylum, "^p__", ""),
+      phylum = ifelse(is.na(phylum) | phylum == "" | phylum == "unidentified", "Unclassified", phylum)
+    )
+}
+
+tax_df <- tax_df %>%
+  mutate(
+    phylum = str_replace_all(phylum, "^p_", ""),
+    phylum = str_replace_all(phylum, "^p__", ""),
+    phylum = str_replace_all(phylum, "_", " "),
+    phylum = ifelse(is.na(phylum) | phylum == "", "Unclassified", phylum)
+  ) %>%
+  distinct(SH_ID, .keep_all = TRUE)
+
+# -----------------------------
+# 8. Phylum composition of shared SHs
+# -----------------------------
+if (length(shared_sh) == 0) {
+  stop("所有宿主科共有 SH 数为 0，无法绘制共有 SH 门水平组成图。")
+}
+
+shared_mat <- mat[shared_sh, , drop = FALSE]
+
+# 使用共有 SH 在所有样本中的总 reads 计算门水平相对丰度
+shared_abund <- tibble(
+  SH_ID = rownames(shared_mat),
+  total_reads = rowSums(shared_mat)
+) %>%
+  left_join(tax_df, by = "SH_ID") %>%
+  mutate(
+    phylum = ifelse(is.na(phylum) | phylum == "", "Unclassified", phylum)
+  )
+
+shared_phylum <- shared_abund %>%
+  group_by(phylum) %>%
+  summarise(
+    SH_number = n(),
+    total_reads = sum(total_reads),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    relative_abundance = total_reads / sum(total_reads) * 100
+  ) %>%
+  arrange(desc(relative_abundance))
+
+# 低丰度门合并为 Others，阈值可调整
+threshold <- 1
+
+shared_phylum_plot <- shared_phylum %>%
+  mutate(
+    phylum_plot = ifelse(relative_abundance < threshold, "Others", phylum)
+  ) %>%
+  group_by(phylum_plot) %>%
+  summarise(
+    SH_number = sum(SH_number),
+    total_reads = sum(total_reads),
+    relative_abundance = sum(relative_abundance),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(relative_abundance)) %>%
+  mutate(
+    phylum_plot = factor(phylum_plot, levels = phylum_plot),
+    label = paste0(phylum_plot, "\n", sprintf("%.1f%%", relative_abundance))
+  )
+
+write.csv(
+  shared_phylum,
+  file.path(out_dir, "shared_SHs_all_host_families_phylum_composition_full.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  shared_phylum_plot,
+  file.path(out_dir, "shared_SHs_all_host_families_phylum_composition_plot.csv"),
+  row.names = FALSE
+)
+
+# -----------------------------
+# 9. Pie chart
+# -----------------------------
+p_pie <- ggplot(shared_phylum_plot, aes(x = "", y = relative_abundance, fill = phylum_plot)) +
+  geom_col(width = 1, color = "white", linewidth = 0.3) +
+  coord_polar(theta = "y") +
+  geom_text(
+    aes(label = ifelse(relative_abundance >= 3, sprintf("%.1f%%", relative_abundance), "")),
+    position = position_stack(vjust = 0.5),
+    size = 4,
+    family = "Times"
+  ) +
+  labs(
+    x = NULL,
+    y = NULL,
+    fill = "Phylum"
+  ) +
+  theme_void(base_family = "Times") +
+  theme(
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11),
+    plot.margin = margin(10, 10, 10, 10)
+  )
+
+ggsave(
+  file.path(out_dir, "Fig3_2_shared_SHs_all_host_families_phylum_pie.pdf"),
+  p_pie,
+  width = 7,
+  height = 5.5,
+  device = cairo_pdf
+)
+
+ggsave(
+  file.path(out_dir, "Fig3_2_shared_SHs_all_host_families_phylum_pie.png"),
+  p_pie,
+  width = 7,
+  height = 5.5,
+  dpi = 300
+)
+
+# -----------------------------
+# 10. Bar plot version, easier to read
+# -----------------------------
+p_bar <- ggplot(shared_phylum_plot, aes(x = reorder(phylum_plot, relative_abundance), y = relative_abundance)) +
+  geom_col(width = 0.75) +
+  geom_text(
+    aes(label = sprintf("%.1f%%", relative_abundance)),
+    hjust = -0.1,
+    size = 4,
+    family = "Times"
+  ) +
+  coord_flip() +
+  scale_y_continuous(
+    limits = c(0, max(shared_phylum_plot$relative_abundance) * 1.15),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  labs(
+    x = NULL,
+    y = "Relative abundance (%)"
+  ) +
+  theme_classic(base_family = "Times") +
+  theme(
+    axis.text = element_text(size = 11),
+    axis.title = element_text(size = 12)
+  )
+
+ggsave(
+  file.path(out_dir, "Fig3_2_shared_SHs_all_host_families_phylum_bar.pdf"),
+  p_bar,
+  width = 7,
+  height = 5,
+  device = cairo_pdf
+)
+
+ggsave(
+  file.path(out_dir, "Fig3_2_shared_SHs_all_host_families_phylum_bar.png"),
+  p_bar,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+
+# -----------------------------
+# 11. Summary
+# -----------------------------
+summary_txt <- file.path(out_dir, "host_family_upset_shared_phylum_summary.txt")
+
+sink(summary_txt)
+cat("Host family-level UpSet and shared SH phylum composition summary\n")
+cat("==============================================================\n\n")
+cat("Input BIOM:\n", biom_file, "\n\n")
+cat("Input metadata:\n", metadata_file, "\n\n")
+cat("Input taxonomy:\n", taxonomy_file, "\n\n")
+cat("Matched samples:", ncol(mat), "\n")
+cat("Total SHs in table:", nrow(mat), "\n")
+cat("Host family number:", length(host_families), "\n\n")
+cat("Host family sample numbers:\n")
+print(sort(table(meta2$host_family), decreasing = TRUE))
+cat("\nHost family SH set sizes:\n")
+print(set_size_df)
+cat("\nNumber of SHs shared by all host families:", length(shared_sh), "\n\n")
+cat("Phylum composition of SHs shared by all host families:\n")
+print(shared_phylum_plot)
+sink()
+
+cat("\nDone!\n")
+cat("Output directory:\n", out_dir, "\n")
+cat("Shared SH number:", length(shared_sh), "\n")
+#2. 如果缺 R 包，先安装
+#在 WSL 的 R 里运行一次：
+R
+#然后输入：
+install.packages(c("tidyverse", "Matrix", "UpSetR", "scales", "Cairo"))
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+BiocManager::install("biomformat")
+q()
+#如果这些包已经有了，可以跳过。
+#3. 运行脚本
+#回到 WSL 终端运行：
+Rscript scripts/03_host_family_upset_shared_phylum.R
+#运行结束后看输出目录：
+ls -lh /mnt/d/ITS_SH_pipeline/globalfungi_style_test/results/chapter3_host_family_upset
+#4. 主要输出文件
+#你重点看这几个：
+#/mnt/d/ITS_SH_pipeline/globalfungi_style_test/results/chapter3_host_family_upset/Fig3_1_host_family_shared_unique_SH_UpSet.pdf
+#/mnt/d/ITS_SH_pipeline/globalfungi_style_test/results/chapter3_host_family_upset/Fig3_1_host_family_shared_unique_SH_UpSet.png
+#/mnt/d/ITS_SH_pipeline/globalfungi_style_test/results/chapter3_host_family_upset/Fig3_2_shared_SHs_all_host_families_phylum_pie.pdf
+#/mnt/d/ITS_SH_pipeline/globalfungi_style_test/results/chapter3_host_family_upset/Fig3_2_shared_SHs_all_host_families_phylum_bar.pdf
+#还有几个结果表：
+#host_family_SH_set_size.csv
+#host_family_SH_presence_absence_matrix.csv
+#shared_SHs_all_host_families.txt
+#shared_SHs_all_host_families_phylum_composition_full.csv
+#shared_SHs_all_host_families_phylum_composition_plot.csv
+#host_family_upset_shared_phylum_summary.txt
+#5. 结果解释时要注意
+#这个脚本里的 UpSet 图是按 presence/absence 做的：
+#也就是某个 SH 在某个宿主科中只要 reads > 0，就认为该宿主科检出了这个 SH。
+#共有 SH 门水平组成图的逻辑是：
+#先找出所有宿主科都检出的 SH，然后统计这些共有 SH 在全部样本中的 reads 总量，再按门水平汇总为相对丰度。
+#下一步我建议一个脚本做三件事：
+#宿主科水平真菌门水平组成堆叠柱状图
+#宿主科 × Top20 真菌属弦图
+#自动导出 Top20 属功能注释模板；如果你把功能型填好，再次运行同一个脚本，就会自动生成宿主科主要真菌属功能型组成图
+#这样最省事，也最稳。
+#一、输出目录
+#这一步结果我建议放到：
+#/mnt/d/ITS_SH_pipeline/globalfungi_style_test/results/chapter3_family_composition
+#二、先建脚本
+#先到项目目录：
+cd /mnt/d/ITS_SH_pipeline
+#新建脚本：
+nano scripts/04_family_composition_phylum_genus_function.R
+#把下面整段完整复制进去：
+# ============================================================
+# Chapter 3
+# Host family-level:
+# 1) phylum composition stacked bar plot
+# 2) host_family × top20 genus chord diagram
+# 3) main genus functional composition plot
+#
+# Input:
+#   - merged_SH_globalfungi_style_nozero_with_taxonomy.biom
+#   - metadata_valid_globalfungi_SH_nozero.csv
+#   - SH_taxonomy_matched.tsv
+#
+# Output:
+#   - chapter3_family_composition/
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(biomformat)
+  library(tidyverse)
+  library(circlize)
+  library(scales)
+})
+
+# -----------------------------
+# 1. Paths
+# -----------------------------
+base_dir <- "/mnt/d/ITS_SH_pipeline/globalfungi_style_test"
+
+biom_file <- file.path(
+  base_dir,
+  "taxonomy/merged_SH_globalfungi_style_nozero_with_taxonomy.biom"
+)
+
+metadata_file <- file.path(
+  base_dir,
+  "metadata/metadata_valid_globalfungi_SH_nozero.csv"
+)
+
+taxonomy_file <- file.path(
+  base_dir,
+  "taxonomy/SH_taxonomy_matched.tsv"
+)
+
+out_dir <- file.path(
+  base_dir,
+  "results/chapter3_family_composition"
+)
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# 功能注释文件（如果不存在，脚本会自动生成模板）
+function_annotation_file <- file.path(
+  out_dir,
+  "top20_genus_function_annotation.csv"
+)
+
+# -----------------------------
+# 2. Helpers
+# -----------------------------
+detect_sample_col <- function(df) {
+  possible_sample_cols <- c("sample_id", "SampleID", "sampleid", "sample_name", "id", "#SampleID")
+  sample_col <- possible_sample_cols[possible_sample_cols %in% colnames(df)][1]
+  if (is.na(sample_col)) stop("没有找到样本ID列，请检查metadata。")
+  return(sample_col)
+}
+
+clean_taxon_name <- function(x) {
+  x <- as.character(x)
+  x[is.na(x)] <- "Unclassified"
+  x <- trimws(x)
+  x[x == ""] <- "Unclassified"
+  x <- gsub("^p__", "", x)
+  x <- gsub("^g__", "", x)
+  x <- gsub("^p_", "", x)
+  x <- gsub("^g_", "", x)
+  x <- gsub("_", " ", x)
+  x[x %in% c("unidentified", "uncultured", "Incertae sedis", "NA", "nan")] <- "Unclassified"
+  x
+}
+
+extract_rank_from_taxonomy <- function(taxonomy, rank_prefix = "p") {
+  # 例如 rank_prefix = "p" 提取 p__Basidiomycota
+  pattern <- paste0(rank_prefix, "__[^;|]+")
+  x <- stringr::str_extract(taxonomy, pattern)
+  x <- gsub(paste0("^", rank_prefix, "__"), "", x)
+  x <- clean_taxon_name(x)
+  return(x)
+}
+
+make_color_vector <- function(n) {
+  hues <- seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+
+# -----------------------------
+# 3. Read metadata
+# -----------------------------
+meta <- read.csv(
+  metadata_file,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+if (!"host_family" %in% colnames(meta)) {
+  stop("metadata 中没有 host_family 列。")
+}
+
+sample_col <- detect_sample_col(meta)
+
+meta <- meta %>%
+  mutate(
+    sample_id = .data[[sample_col]],
+    host_family = trimws(as.character(host_family))
+  ) %>%
+  filter(
+    !is.na(sample_id), sample_id != "",
+    !is.na(host_family), host_family != "",
+    host_family != "NA",
+    host_family != "missing",
+    host_family != "not_recorded",
+    host_family != "not reported"
+  ) %>%
+  distinct(sample_id, .keep_all = TRUE)
+
+cat("Metadata samples:", nrow(meta), "\n")
+cat("Host family counts:\n")
+print(sort(table(meta$host_family), decreasing = TRUE))
+
+# -----------------------------
+# 4. Read BIOM
+# -----------------------------
+biom <- read_biom(biom_file)
+mat <- as(biom_data(biom), "matrix")  # feature x sample
+
+cat("Original BIOM dim:", nrow(mat), "features x", ncol(mat), "samples\n")
+
+common_samples <- intersect(colnames(mat), meta$sample_id)
+if (length(common_samples) == 0) {
+  stop("BIOM与metadata没有匹配到共同样本。")
+}
+
+mat <- mat[, common_samples, drop = FALSE]
+meta2 <- meta %>%
+  filter(sample_id %in% common_samples)
+
+meta2 <- meta2[match(colnames(mat), meta2$sample_id), ]
+
+cat("Matched samples:", ncol(mat), "\n")
+cat("Matched host families:\n")
+print(sort(table(meta2$host_family), decreasing = TRUE))
+
+host_families <- names(sort(table(meta2$host_family), decreasing = TRUE))
+
+# -----------------------------
+# 5. Convert to relative abundance
+# -----------------------------
+sample_sums <- colSums(mat)
+if (any(sample_sums == 0)) {
+  stop("仍存在总reads为0的样本，请检查。")
+}
+
+mat_rel <- sweep(mat, 2, sample_sums, FUN = "/") * 100
+
+# -----------------------------
+# 6. Read taxonomy
+# -----------------------------
+tax_raw <- read.delim(
+  taxonomy_file,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+possible_id_cols <- c("SH", "SH_ID", "Feature.ID", "FeatureID", "feature_id", "ID", "id", "#OTUID", "OTUID")
+id_col <- possible_id_cols[possible_id_cols %in% colnames(tax_raw)][1]
+if (is.na(id_col)) {
+  id_col <- colnames(tax_raw)[1]
+  message("未识别标准SH列，默认使用第一列：", id_col)
+}
+
+possible_tax_cols <- c("taxonomy", "Taxon", "taxon", "Taxonomy", "UNITE_taxonomy")
+tax_col <- possible_tax_cols[possible_tax_cols %in% colnames(tax_raw)][1]
+
+if (!is.na(tax_col)) {
+  tax_df <- tax_raw %>%
+    transmute(
+      SH_ID = .data[[id_col]],
+      taxonomy = as.character(.data[[tax_col]])
+    ) %>%
+    mutate(
+      phylum = extract_rank_from_taxonomy(taxonomy, "p"),
+      genus  = extract_rank_from_taxonomy(taxonomy, "g")
+    )
+} else {
+  # 如果没有taxonomy列，就尝试直接找phylum和genus列
+  if (!all(c("phylum", "genus") %in% colnames(tax_raw))) {
+    stop("taxonomy文件中既没有taxonomy列，也没有phylum/genus列。")
+  }
+  tax_df <- tax_raw %>%
+    transmute(
+      SH_ID = .data[[id_col]],
+      phylum = clean_taxon_name(phylum),
+      genus = clean_taxon_name(genus)
+    )
+}
+
+tax_df <- tax_df %>%
+  mutate(
+    phylum = ifelse(is.na(phylum) | phylum == "", "Unclassified", phylum),
+    genus  = ifelse(is.na(genus)  | genus  == "", "Unclassified", genus)
+  ) %>%
+  distinct(SH_ID, .keep_all = TRUE)
+
+# 按 biom feature 顺序对齐 taxonomy
+tax_match <- tax_df[match(rownames(mat_rel), tax_df$SH_ID), ]
+
+if (nrow(tax_match) != nrow(mat_rel)) {
+  stop("taxonomy 与 biom feature 行数不匹配。")
+}
+
+tax_match$phylum[is.na(tax_match$phylum)] <- "Unclassified"
+tax_match$genus[is.na(tax_match$genus)] <- "Unclassified"
+
+# -----------------------------
+# 7. Aggregate to phylum and genus
+# -----------------------------
+phylum_mat <- rowsum(mat_rel, group = tax_match$phylum, reorder = FALSE)
+genus_mat  <- rowsum(mat_rel, group = tax_match$genus,  reorder = FALSE)
+
+# -----------------------------
+# 8. Mean composition by host_family
+# -----------------------------
+calc_group_mean <- function(abund_mat, meta_df, group_col = "host_family", group_levels = NULL) {
+  if (is.null(group_levels)) group_levels <- unique(meta_df[[group_col]])
+  out <- sapply(group_levels, function(g) {
+    samp <- meta_df$sample_id[meta_df[[group_col]] == g]
+    if (length(samp) == 1) {
+      abund_mat[, samp]
+    } else {
+      rowMeans(abund_mat[, samp, drop = FALSE])
+    }
+  })
+  out <- as.matrix(out)
+  colnames(out) <- group_levels
+  return(out)
+}
+
+phylum_family_mean <- calc_group_mean(phylum_mat, meta2, "host_family", host_families)
+genus_family_mean  <- calc_group_mean(genus_mat,  meta2, "host_family", host_families)
+
+write.csv(
+  as.data.frame(phylum_family_mean) %>% rownames_to_column("phylum"),
+  file.path(out_dir, "host_family_phylum_mean_relative_abundance.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  as.data.frame(genus_family_mean) %>% rownames_to_column("genus"),
+  file.path(out_dir, "host_family_genus_mean_relative_abundance.csv"),
+  row.names = FALSE
+)
+
+# -----------------------------
+# 9. Phylum stacked bar plot
+# -----------------------------
+phylum_overall_mean <- rowMeans(phylum_family_mean)
+major_phyla <- names(phylum_overall_mean[phylum_overall_mean >= 1])  # 平均相对丰度 >= 1%
+if (length(major_phyla) == 0) {
+  major_phyla <- names(sort(phylum_overall_mean, decreasing = TRUE))[1:min(10, length(phylum_overall_mean))]
+}
+
+phylum_plot_df <- as.data.frame(phylum_family_mean) %>%
+  rownames_to_column("phylum") %>%
+  mutate(
+    phylum_plot = ifelse(phylum %in% major_phyla, phylum, "Others")
+  ) %>%
+  group_by(phylum_plot) %>%
+  summarise(across(all_of(host_families), sum), .groups = "drop") %>%
+  pivot_longer(
+    cols = all_of(host_families),
+    names_to = "host_family",
+    values_to = "relative_abundance"
+  )
+
+# 为了堆叠顺序更稳定
+phylum_order <- phylum_plot_df %>%
+  group_by(phylum_plot) %>%
+  summarise(mean_abund = mean(relative_abundance), .groups = "drop") %>%
+  arrange(desc(mean_abund)) %>%
+  pull(phylum_plot)
+
+phylum_plot_df$phylum_plot <- factor(phylum_plot_df$phylum_plot, levels = rev(phylum_order))
+phylum_plot_df$host_family <- factor(phylum_plot_df$host_family, levels = host_families)
+
+p_phylum <- ggplot(phylum_plot_df, aes(x = host_family, y = relative_abundance, fill = phylum_plot)) +
+  geom_col(width = 0.75) +
+  labs(
+    x = "Host family",
+    y = "Mean relative abundance (%)",
+    fill = "Phylum"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 30, hjust = 1),
+    legend.position = "right"
+  )
+
+ggsave(
+  file.path(out_dir, "Fig3_3_host_family_phylum_stacked_bar.pdf"),
+  p_phylum,
+  width = 9,
+  height = 6
+)
+
+ggsave(
+  file.path(out_dir, "Fig3_3_host_family_phylum_stacked_bar.png"),
+  p_phylum,
+  width = 9,
+  height = 6,
+  dpi = 300
+)
+
+# -----------------------------
+# 10. Top20 genus chord diagram
+# -----------------------------
+genus_overall_mean <- rowMeans(genus_family_mean)
+
+# 建议先排除未分类属
+genus_overall_mean2 <- genus_overall_mean
+genus_overall_mean2[names(genus_overall_mean2) %in% c("Unclassified")] <- -Inf
+
+top20_genera <- names(sort(genus_overall_mean2, decreasing = TRUE))[1:min(20, sum(is.finite(genus_overall_mean2)))]
+top20_genera <- top20_genera[is.finite(genus_overall_mean2[top20_genera])]
+
+write.table(
+  top20_genera,
+  file.path(out_dir, "top20_genera.txt"),
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = FALSE
+)
+
+chord_mat <- genus_family_mean[top20_genera, host_families, drop = FALSE]
+chord_mat <- t(chord_mat)  # 行=host_family, 列=genus
+
+write.csv(
+  as.data.frame(chord_mat) %>% rownames_to_column("host_family"),
+  file.path(out_dir, "host_family_top20_genus_chord_matrix.csv"),
+  row.names = FALSE
+)
+
+# 给颜色
+hf_cols <- setNames(make_color_vector(length(host_families)), host_families)
+genus_cols <- setNames(make_color_vector(length(top20_genera)), top20_genera)
+grid_cols <- c(hf_cols, genus_cols)
+
+# 输出弦图
+pdf(file.path(out_dir, "Fig3_4_host_family_top20_genus_chord.pdf"), width = 10, height = 10)
+circos.clear()
+circos.par(gap.after = c(rep(6, length(host_families) - 1), 18, rep(2, length(top20_genera) - 1), 18))
+
+chordDiagram(
+  x = chord_mat,
+  grid.col = grid_cols,
+  transparency = 0.25,
+  annotationTrack = c("grid"),
+  preAllocateTracks = list(track.height = 0.08)
+)
+
+circos.trackPlotRegion(
+  track.index = 1,
+  panel.fun = function(x, y) {
+    sector.name <- get.cell.meta.data("sector.index")
+    xlim <- get.cell.meta.data("xlim")
+    ylim <- get.cell.meta.data("ylim")
+    circos.text(
+      x = mean(xlim),
+      y = ylim[1] + 0.2,
+      labels = sector.name,
+      facing = "clockwise",
+      niceFacing = TRUE,
+      adj = c(0, 0.5),
+      cex = 0.7
+    )
+  },
+  bg.border = NA
+)
+circos.clear()
+dev.off()
+
+png(file.path(out_dir, "Fig3_4_host_family_top20_genus_chord.png"), width = 3000, height = 3000, res = 300)
+circos.clear()
+circos.par(gap.after = c(rep(6, length(host_families) - 1), 18, rep(2, length(top20_genera) - 1), 18))
+
+chordDiagram(
+  x = chord_mat,
+  grid.col = grid_cols,
+  transparency = 0.25,
+  annotationTrack = c("grid"),
+  preAllocateTracks = list(track.height = 0.08)
+)
+
+circos.trackPlotRegion(
+  track.index = 1,
+  panel.fun = function(x, y) {
+    sector.name <- get.cell.meta.data("sector.index")
+    xlim <- get.cell.meta.data("xlim")
+    ylim <- get.cell.meta.data("ylim")
+    circos.text(
+      x = mean(xlim),
+      y = ylim[1] + 0.2,
+      labels = sector.name,
+      facing = "clockwise",
+      niceFacing = TRUE,
+      adj = c(0, 0.5),
+      cex = 0.7
+    )
+  },
+  bg.border = NA
+)
+circos.clear()
+dev.off()
+
+# -----------------------------
+# 11. Top20 genus function annotation template
+# -----------------------------
+if (!file.exists(function_annotation_file)) {
+  template_df <- data.frame(
+    genus = top20_genera,
+    function_group = "",
+    source = "",
+    note = "",
+    stringsAsFactors = FALSE
+  )
+  write.csv(template_df, function_annotation_file, row.names = FALSE)
+  cat("\n已生成功能注释模板：\n", function_annotation_file, "\n")
+  cat("请填写 function_group 列，可用类别：saprotroph, symbiotroph, pathotroph, mixed, uncertain\n")
+}
+
+# -----------------------------
+# 12. Function composition plot (if annotation file exists and completed)
+# -----------------------------
+if (file.exists(function_annotation_file)) {
+  func_df <- read.csv(function_annotation_file, stringsAsFactors = FALSE, check.names = FALSE)
+
+  if (!all(c("genus", "function_group") %in% colnames(func_df))) {
+    warning("功能注释文件缺少 genus / function_group 列，跳过功能图。")
+  } else {
+    func_df <- func_df %>%
+      mutate(
+        genus = as.character(genus),
+        function_group = tolower(trimws(as.character(function_group))),
+        function_group = ifelse(function_group == "" | is.na(function_group), "uncertain", function_group)
+      )
+
+    valid_groups <- c("saprotroph", "symbiotroph", "pathotroph", "mixed", "uncertain")
+    func_df$function_group[!func_df$function_group %in% valid_groups] <- "uncertain"
+
+    # 只用top20 genus
+    genus_func_long <- as.data.frame(chord_mat) %>%
+      rownames_to_column("host_family") %>%
+      pivot_longer(
+        cols = -host_family,
+        names_to = "genus",
+        values_to = "mean_relative_abundance"
+      ) %>%
+      left_join(func_df, by = "genus") %>%
+      mutate(
+        function_group = ifelse(is.na(function_group) | function_group == "", "uncertain", function_group)
+      )
+
+    # 各宿主科内部，对top20 genus功能型组成标准化到100%
+    family_func <- genus_func_long %>%
+      group_by(host_family, function_group) %>%
+      summarise(abund = sum(mean_relative_abundance), .groups = "drop") %>%
+      group_by(host_family) %>%
+      mutate(relative_percent_within_top20 = abund / sum(abund) * 100) %>%
+      ungroup()
+
+    write.csv(
+      family_func,
+      file.path(out_dir, "host_family_top20_genus_function_composition.csv"),
+      row.names = FALSE
+    )
+
+    family_func$host_family <- factor(family_func$host_family, levels = host_families)
+    family_func$function_group <- factor(
+      family_func$function_group,
+      levels = c("saprotroph", "symbiotroph", "pathotroph", "mixed", "uncertain")
+    )
+
+    p_func_bar <- ggplot(family_func, aes(x = host_family, y = relative_percent_within_top20, fill = function_group)) +
+      geom_col(width = 0.75) +
+      labs(
+        x = "Host family",
+        y = "Relative abundance within top20 genera (%)",
+        fill = "Function group"
+      ) +
+      theme_classic(base_size = 12) +
+      theme(
+        axis.text.x = element_text(angle = 30, hjust = 1),
+        legend.position = "right"
+      )
+
+    ggsave(
+      file.path(out_dir, "Fig3_5_host_family_top20_genus_function_bar.pdf"),
+      p_func_bar,
+      width = 8.5,
+      height = 5.5
+    )
+
+    ggsave(
+      file.path(out_dir, "Fig3_5_host_family_top20_genus_function_bar.png"),
+      p_func_bar,
+      width = 8.5,
+      height = 5.5,
+      dpi = 300
+    )
+
+    # 总体功能型饼图
+    overall_func <- genus_func_long %>%
+      group_by(function_group) %>%
+      summarise(abund = sum(mean_relative_abundance), .groups = "drop") %>%
+      mutate(percent = abund / sum(abund) * 100)
+
+    write.csv(
+      overall_func,
+      file.path(out_dir, "overall_top20_genus_function_composition.csv"),
+      row.names = FALSE
+    )
+
+    p_func_pie <- ggplot(overall_func, aes(x = "", y = percent, fill = function_group)) +
+      geom_col(width = 1, color = "white") +
+      coord_polar(theta = "y") +
+      geom_text(
+        aes(label = ifelse(percent >= 3, sprintf("%.1f%%", percent), "")),
+        position = position_stack(vjust = 0.5),
+        size = 4
+      ) +
+      labs(fill = "Function group") +
+      theme_void(base_size = 12)
+
+    ggsave(
+      file.path(out_dir, "Fig3_5b_overall_top20_genus_function_pie.pdf"),
+      p_func_pie,
+      width = 7,
+      height = 5.5
+    )
+
+    ggsave(
+      file.path(out_dir, "Fig3_5b_overall_top20_genus_function_pie.png"),
+      p_func_pie,
+      width = 7,
+      height = 5.5,
+      dpi = 300
+    )
+  }
+}
+
+# -----------------------------
+# 13. Summary
+# -----------------------------
+summary_file <- file.path(out_dir, "family_composition_summary.txt")
+
+sink(summary_file)
+cat("Host family composition analysis summary\n")
+cat("=======================================\n\n")
+cat("Input biom:\n", biom_file, "\n\n")
+cat("Input metadata:\n", metadata_file, "\n\n")
+cat("Input taxonomy:\n", taxonomy_file, "\n\n")
+cat("Matched samples:", ncol(mat_rel), "\n")
+cat("Host families:\n")
+print(sort(table(meta2$host_family), decreasing = TRUE))
+cat("\nMajor phyla used in stacked bar:\n")
+print(major_phyla)
+cat("\nTop20 genera:\n")
+print(top20_genera)
+cat("\nFunction annotation file:\n", function_annotation_file, "\n")
+sink()
+
+cat("\nDone!\n")
+cat("Output dir:\n", out_dir, "\n")
+#三、如果缺包，先安装一次
+#先进入 R：
+R
+#这是因为 R 想弹出窗口让你选 CRAN 镜像，但 WSL 里弹窗失败了。
+#直接在 R 里运行这版：
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+
+install.packages(c("tidyverse", "circlize", "scales"))
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+
+BiocManager::install("biomformat")
+
+q()
+#如果这些包之前已经装过，也可以先不装，直接跑脚本：
+Rscript scripts/04_family_composition_phylum_genus_function.R
+#五、你这次会先得到什么
+#第一次运行后，一定会直接生成前两个图：
+#1）宿主科水平门水平组成堆叠柱状图
+#/mnt/d/ITS_SH_pipeline/globalfungi_style_test/results/chapter3_family_composition/Fig3_3_host_family_phylum_stacked_bar.pdf
+#/mnt/d/ITS_SH_pipeline/globalfungi_style_test/results/chapter3_family_composition/Fig3_3_host_family_phylum_stacked_bar.png
+#2）宿主科 × Top20 真菌属弦图
+#/mnt/d/ITS_SH_pipeline/globalfungi_style_test/results/chapter3_family_composition/Fig3_4_host_family_top20_genus_chord.pdf
+#/mnt/d/ITS_SH_pipeline/globalfungi_style_test/results/chapter3_family_composition/Fig3_4_host_family_top20_genus_chord.png
+#同时还会生成一些表：
+#host_family_phylum_mean_relative_abundance.csv
+#host_family_genus_mean_relative_abundance.csv
+#top20_genera.txt
+#host_family_top20_genus_chord_matrix.csv
+#六、功能型图这一步怎么做
+#第一次运行后，还会自动生成一个模板文件：
+#/mnt/d/ITS_SH_pipeline/globalfungi_style_test/results/chapter3_family_composition/top20_genus_function_annotation.csv
+#你打开这个表，把 function_group 这一列填好即可。
+#/mnt/d/fungal_ITS/FungalTraits_release/output/data/funToTheFun.csv
+#这个文件是长表格式，不是一列一个功能，所以肉眼看起来确实“啥也没有”。
+#它有用的功能列其实藏在 trait_name 这一列里：
+#trait_name = trophic_mode_fg
+#trait_name = guild_fg
+#trait_name = confidence_fg
+#trait_name = growth_form_fg
+#trait_name = trait_fg
+#trait_name = source_funguild_fg
+#对应的功能结果在 value 这一列。
+#所以不能直接看 Excel 横向列，要先把它转成宽表。你在 WSL 的 R 里这样查：
+ft <- read.csv("/mnt/d/fungal_ITS/FungalTraits_release/output/data/funToTheFun.csv",
+               stringsAsFactors = FALSE,
+               check.names = FALSE)
+
+unique(ft$trait_name)
+#然后查 Top20 属相关功能信息：
+top20 <- read.csv("/mnt/d/ITS_SH_pipeline/globalfungi_style_test/results/chapter3_family_composition/top20_genus_function_annotation.csv",
+                  stringsAsFactors = FALSE)
+
+ft_use <- ft[ft$trait_name %in% c("Genus", "trophic_mode_fg", "guild_fg",
+                                  "confidence_fg", "growth_form_fg",
+                                  "trait_fg", "source_funguild_fg", "notes_fg"), ]
+
+library(tidyr)
+library(dplyr)
+
+ft_wide <- ft_use %>%
+  select(speciesMatched, trait_name, value) %>%
+  distinct() %>%
+  pivot_wider(names_from = trait_name, values_from = value, values_fn = paste, values_sep = "; ")
+
+ft_top20 <- ft_wide %>%
+  filter(Genus %in% top20$genus) %>%
+  select(Genus, speciesMatched, trophic_mode_fg, guild_fg, confidence_fg,
+         growth_form_fg, trait_fg, source_funguild_fg, notes_fg)
+
+write.csv(ft_top20,
+          "/mnt/d/ITS_SH_pipeline/globalfungi_style_test/results/chapter3_family_composition/top20_genus_FungalTraits_matched.csv",
+          row.names = FALSE)
+#然后打开这个文件看：
+#/mnt/d/ITS_SH_pipeline/globalfungi_style_test/results/chapter3_family_composition/top20_genus_FungalTraits_matched.csv
+#你会看到每个属对应的 trophic_mode_fg 和 guild_fg，这才是能用来归类的内容。
+#当前 tidyr::pivot_wider() 版本不支持 values_sep 这个参数。
+#把这一步改成下面这版即可：
+ft_wide <- ft_use %>%
+  select(speciesMatched, trait_name, value) %>%
+  distinct() %>%
+  group_by(speciesMatched, trait_name) %>%
+  summarise(value = paste(unique(value), collapse = "; "), .groups = "drop") %>%
+  pivot_wider(names_from = trait_name, values_from = value)
+#然后继续跑后面的：
+ft_top20 <- ft_wide %>%
+  filter(Genus %in% top20$genus) %>%
+  select(Genus, speciesMatched, trophic_mode_fg, guild_fg, confidence_fg,
+         growth_form_fg, trait_fg, source_funguild_fg, notes_fg)
+
+write.csv(ft_top20,
+          "/mnt/d/ITS_SH_pipeline/globalfungi_style_test/results/chapter3_family_composition/top20_genus_FungalTraits_matched.csv",
+          row.names = FALSE)
+#不用重新读文件，直接从 ft_wide <- ... 这一步开始复制运行就行。
+#下一步是：把 FungalTraits 匹配结果整理成你作图脚本需要的 top20_genus_function_annotation.csv。
+#你先在 WSL 的 R 里运行下面这段，它会根据 trophic_mode_fg 和 guild_fg 自动生成一个“建议版功能分类表”。
+#运行后会生成：
+#/mnt/d/ITS_SH_pipeline/globalfungi_style_test/results/chapter3_family_composition/top20_genus_function_annotation_auto.csv
+#这个自动分类表基本可以用，但建议手动改几处再覆盖正式表。
+#主要问题是有几个属 FungalTraits 没匹配到，自动归成了 uncertain，但根据常见生态功能可以更合理地保守补充。
+#先退出 R：
+q()
+#看到：Save workspace image? [y/n/c]:
+#输入：
+n
+#回到 WSL 终端后，再运行下面命令生成手动修正版正式表：
+cat > /mnt/d/ITS_SH_pipeline/globalfungi_style_test/results/chapter3_family_composition/top20_genus_function_annotation.csv <<'EOF'
+genus,function_group,source,note
+Kazachstania,mixed,manual conservative classification,yeast genus; ecological role not assigned to a single trophic mode
+Aspergillus,mixed,FungalTraits/FUNGuild-derived,Pathotroph-Saprotroph mixed assignments
+Thelebolus,mixed,FungalTraits/FUNGuild-derived,Saprotroph-Symbiotroph; Dung Saprotroph-Endophyte
+Ascochyta,pathotroph,manual conservative classification,commonly plant pathogenic genus
+Sordaria,saprotroph,FungalTraits/FUNGuild-derived,Dung Saprotroph-Wood Saprotroph
+Fungi gen Incertae sedis,uncertain,manual conservative classification,unresolved fungal genus
+Caecomyces,symbiotroph,manual conservative classification,anaerobic gut fungus associated with herbivore digestive tract
+Wallemia,saprotroph,manual conservative classification,environmental/saprotrophic fungus; conservative assignment
+Sporormiella,mixed,FungalTraits/FUNGuild-derived,Pathotroph-Saprotroph; dung-associated saprotrophic genus
+Cladosporium,mixed,FungalTraits/FUNGuild-derived,Plant Pathogen-Endophyte-Saprotroph mixed assignments
+Naganishia,mixed,manual conservative classification,yeast genus; ecological role not assigned to a single trophic mode
+Penicillium,mixed,FungalTraits/FUNGuild-derived,Pathotroph/Symbiotroph and animal/plant pathogen assignments
+Fusarium,mixed,FungalTraits/FUNGuild-derived,Pathotroph-Saprotroph-Symbiotroph mixed assignments
+Preussia,saprotroph,manual conservative classification,dung/soil-associated saprotrophic genus
+Alternaria,mixed,FungalTraits/FUNGuild-derived,Pathotroph-Saprotroph-Symbiotroph mixed assignments
+Khoyollomyces,symbiotroph,manual conservative classification,anaerobic gut fungus associated with herbivore digestive tract
+Saccharomyces,saprotroph,FungalTraits/FUNGuild-derived,Undefined Saprotroph
+Pezizales gen Incertae sedis,uncertain,manual conservative classification,unresolved genus within Pezizales
+Cladonia,symbiotroph,FungalTraits/FUNGuild-derived,Lichenized symbiotroph
+Neocallimastix,symbiotroph,manual conservative classification,anaerobic gut fungus associated with herbivore digestive tract
+EOF
+#然后重新跑作图脚本：
+Rscript scripts/04_family_composition_phylum_genus_function.R
+#这样会生成正式功能型图。后面论文里可以写成：“基于 FungalTraits/FUNGuild 注释结果，并结合优势属已知生态属性进行保守校正，将 Top20 优势属划分为 saprotroph、symbiotroph、pathotroph、mixed 和 uncertain 五类。”
